@@ -1,1 +1,3186 @@
-wha
+-- AutoFarm extracted from the supplied script and adapted to WindUI.
+-- Official WindUI repository: https://github.com/Footagesus/WindUI
+
+local WindUI = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
+))()
+
+local Window = WindUI:CreateWindow({
+    Title = "AutoFarm",
+    Icon = "zap",
+    Folder = "AutoFarm",
+})
+
+local AutoFarmTab = Window:Tab({
+    Title = "AutoFarm",
+    Icon = "bot",
+})
+
+local SettingsTab = Window:Tab({
+    Title = "Settings",
+    Icon = "settings",
+})
+
+
+-- Persistent toggle configuration. The executor filesystem is used so settings survive reloads.
+local HttpService = game:GetService("HttpService")
+local FARM_CONFIG_FILE = "farm5556371828"
+local farm_config = {
+    grab_gun = false,
+    auto_farm = false,
+    murder_check = false,
+    auto_reset_sheriff = false,
+    auto_reset_murderer = false,
+    auto_reset_innocent = false,
+    fling_murderer_sheriff = false,
+    fling_murderer_innocent = false,
+    kill_all = false,
+    autoshoot = false,
+    anti_afk = false,
+    anti_fling = false,
+    anti_void = false,
+    anti_trap = false,
+    disable_render = false,
+    farm_speed = 23,
+    farm_type = "Basic",
+    fps_cap = 60,
+    server_hop_kicked = false,
+    server_hop_stuck = false,
+    server_hop_players = false,
+    server_hop_player_limit = 3,
+}
+
+local function farm_config_load()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then return end
+    local ok, exists = pcall(isfile, FARM_CONFIG_FILE)
+    if not ok or not exists then return end
+    local ok_read, raw = pcall(readfile, FARM_CONFIG_FILE)
+    if not ok_read or type(raw) ~= "string" or raw == "" then return end
+    local ok_decode, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if ok_decode and type(data) == "table" then
+        for key, default in pairs(farm_config) do
+            if type(default) == "boolean" and type(data[key]) == "boolean" then
+                farm_config[key] = data[key]
+            elseif type(default) == "number" and type(data[key]) == "number" then
+                farm_config[key] = data[key]
+            elseif type(default) == "string" and type(data[key]) == "string" then
+                farm_config[key] = data[key]
+            end
+        end
+    end
+end
+
+local function farm_config_save()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        writefile(FARM_CONFIG_FILE, HttpService:JSONEncode(farm_config))
+    end)
+end
+
+getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
+
+local function farm_config_set(key, value)
+    if farm_config[key] == value then return end
+    farm_config[key] = value
+    farm_config_save()
+end
+
+farm_config_load()
+if type(isfile) == "function" and type(readfile) == "function" then
+    local ok_exists, exists = pcall(isfile, FARM_CONFIG_FILE)
+    if ok_exists and not exists then
+        farm_config_save()
+    end
+end
+
+do
+	local players = game:GetService("Players")
+	local lp = players.LocalPlayer
+
+	local autograb_on = false
+
+	local grab_rs = game:GetService("ReplicatedStorage")
+	local grab_round_mod = nil
+	local function grab_has_role()
+		if not grab_round_mod then
+			local ok, m = pcall(function()
+				return require(grab_rs:WaitForChild("Modules"):WaitForChild("CurrentRoundClient"))
+			end)
+			if ok and type(m) == "table" then grab_round_mod = m end
+		end
+		local d = grab_round_mod and grab_round_mod.PlayerData
+		if type(d) ~= "table" then return false end
+		local me = d[lp.Name]
+		return me ~= nil and me.Role ~= nil and not me.Dead
+	end
+
+	local function has_knife()
+		local char = lp.Character
+		if char and char:FindFirstChild("Knife") then return true end
+		local backpack = lp:FindFirstChildOfClass("Backpack")
+		if backpack and backpack:FindFirstChild("Knife") then return true end
+		return false
+	end
+
+	local function grab_gun(obj)
+		if not autograb_on or has_knife() then return end
+		if not grab_has_role() then return end
+		local char = lp.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not root then return end
+		pcall(function() obj.CFrame = root.CFrame end)
+		local prompt = obj:FindFirstChildOfClass("ProximityPrompt")
+		if prompt then
+			pcall(function() fireproximityprompt(prompt) end)
+		end
+	end
+
+	local function scan_guns()
+		for _, obj in pairs(workspace:GetDescendants()) do
+			if obj.Name == "GunDrop" and obj:IsA("BasePart") then
+				grab_gun(obj)
+			end
+		end
+	end
+
+	local grab_desc_conn = nil
+
+	local function grab_desc_added(obj)
+		if obj.Name == "GunDrop" and obj:IsA("BasePart") then
+			task.wait(0.1)
+			grab_gun(obj)
+		end
+	end
+
+	local function grab_desc_stop()
+		if grab_desc_conn then
+			pcall(function() grab_desc_conn:Disconnect() end)
+			grab_desc_conn = nil
+		end
+	end
+
+	local run = game:GetService("RunService")
+	local cs = game:GetService("CollectionService")
+	local rs = game:GetService("ReplicatedStorage")
+
+	local autofarm_on = false
+	local autoreset_sheriff_on = false
+	local autoreset_murderer_on = false
+	local autoreset_innocent_on = false
+	local coins_done = false
+	local saw_coins = false
+	local farm_target = nil
+	local nc_cache = {}
+	local round_mod = nil
+	local collected_ids = {}
+	local collected_count = 0
+
+	local farm_mode = (farm_config.farm_type == "Down") and "Down" or "Basic"
+	local farm_speed = tonumber(farm_config.farm_speed) or 23
+	local avoid_murder = false
+	local was_down = false
+
+	-- Anti-targeting map staging: stay above the active map until its coins spawn.
+	local farm_stage_positions = {
+		["Factory"] = Vector3.new(-15.50, 254.82, 8999.22),
+		["Hotel 2"] = Vector3.new(-36.98, 258.45, 9025.54),
+		["Mansion 2"] = Vector3.new(-49.80, 264.44, 8970.55),
+		["Biolab"] = Vector3.new(546.93, 274.27, 9861.57),
+		["Office 3"] = Vector3.new(-87.75, 305.30, 9031.16),
+		["Hospital 3"] = Vector3.new(-46.49, 269.59, 9008.21),
+		["House 2"] = Vector3.new(52.58, 256.70, 8932.28),
+		["Workplace"] = Vector3.new(16.08, 278.46, 9054.51),
+		["Bank 2"] = Vector3.new(33.01, 283.67, 8982.83),
+		["Police station"] = Vector3.new(-8.52, 244.28, 9047.82),
+		["Research Facility"] = Vector3.new(13.28, 278.03, 9056.84),
+		["Mil Base"] = Vector3.new(-58.70, 208.84, 9156.96),
+	}
+	local farm_stage_normalized = {}
+	for name, pos in pairs(farm_stage_positions) do
+		farm_stage_normalized[string.lower((name:gsub("[^%w]", "")))] = { name = name, position = pos }
+	end
+	local farm_stage_name = nil
+	local farm_stage_position = nil
+	local farm_stage_scan_at = 0
+	local farm_stage_ready = false
+	local farm_unknown_stage_position = Vector3.new(14.35, 504.82, -3.25)
+	local farm_unknown_teleport_pending = false
+	local down_ref_y = nil
+	local last_touch = 0
+	local DOWN_DEPTH = 14
+	local DOWN_RISE_XZ = 4
+	local AVOID_DIST = 40
+	local RISE_SAFE_DIST = 20
+
+	getgenv().AUTOFARM_HOLD = false
+
+	local function farm_hrp()
+		local c = lp.Character
+		return c and c:FindFirstChild("HumanoidRootPart")
+	end
+
+	local function get_round_data()
+		if not round_mod then
+			local ok, m = pcall(function()
+				return require(rs:WaitForChild("Modules"):WaitForChild("CurrentRoundClient"))
+			end)
+			if ok and type(m) == "table" then round_mod = m end
+		end
+		return round_mod and round_mod.PlayerData
+	end
+
+	local function local_role()
+		local d = get_round_data()
+		local me = type(d) == "table" and d[lp.Name]
+		return me and me.Role, me
+	end
+
+	local role_reset_busy = false
+	local role_reset_connection = nil
+
+	local function reset_player_target(target)
+		if not target or target == lp or role_reset_busy then return false end
+		local character = lp.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local root = humanoid and humanoid.RootPart
+		local target_character = target.Character
+		local target_root = target_character and target_character:FindFirstChild("HumanoidRootPart")
+		local target_head = target_character and target_character:FindFirstChild("Head")
+		local target_humanoid = target_character and target_character:FindFirstChildOfClass("Humanoid")
+		if not (character and humanoid and root and target_character and target_root) then return false end
+
+		role_reset_busy = true
+		local saved_cframe = root.CFrame
+		humanoid.PlatformStand = true
+		local bv = Instance.new("BodyVelocity")
+		bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+		bv.Velocity = Vector3.new(0, -50000, 0)
+		bv.Parent = root
+		local bg = Instance.new("BodyGyro")
+		bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+		bg.P = 1000000
+		bg.Parent = root
+		local old_destroy_height = workspace.FallenPartsDestroyHeight
+		workspace.FallenPartsDestroyHeight = -100000
+		local started = os.clock()
+
+		role_reset_connection = run.Heartbeat:Connect(function()
+			if not humanoid.Parent or humanoid.Health <= 0 or os.clock() - started > 1.5 or not target.Character or not target_root.Parent or (target_humanoid and target_humanoid.Parent and target_humanoid.Health <= 0) then
+				workspace.FallenPartsDestroyHeight = old_destroy_height
+				bv:Destroy()
+				bg:Destroy()
+				if character.Parent and root.Parent then
+					root.CFrame = saved_cframe
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.AssemblyAngularVelocity = Vector3.zero
+					humanoid.PlatformStand = false
+					humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+				end
+				if role_reset_connection then role_reset_connection:Disconnect(); role_reset_connection = nil end
+				role_reset_busy = false
+				return
+			end
+
+			local head_pos = target_head and target_head.Position or (target_root.Position + Vector3.new(0, 2.5, 0))
+			root.CFrame = CFrame.new(head_pos)
+			root.AssemblyLinearVelocity = Vector3.new(0, -50000, 0)
+			root.AssemblyAngularVelocity = Vector3.new(7500, 7500, 7500)
+			if type(firetouchinterest) == "function" then
+				for _ = 1, 5 do
+					pcall(firetouchinterest, root, target_root, 0)
+					pcall(firetouchinterest, root, target_root, 1)
+					if target_head then
+						pcall(firetouchinterest, root, target_head, 0)
+						pcall(firetouchinterest, root, target_head, 1)
+					end
+				end
+			end
+		end)
+		return true
+	end
+	getgenv().AUTOFARM_ROLE_FLING = reset_player_target
+
+	local function auto_reset_for_role()
+		local role = local_role()
+		if (role == "Sheriff" and autoreset_sheriff_on)
+			or (role == "Murderer" and autoreset_murderer_on)
+			or (role == "Innocent" and autoreset_innocent_on) then
+			local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+			if hum then pcall(function() hum.Health = 0 end) end
+		end
+	end
+
+	local function can_farm()
+		local char = lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if not hum or hum.Health <= 0 then return false end
+		local d = get_round_data()
+		if type(d) == "table" then
+			local me = d[lp.Name]
+			if not me or not me.Role or me.Dead then return false end
+		end
+		return true
+	end
+
+	local function coin_bags_full()
+		local pg = lp:FindFirstChild("PlayerGui")
+		local main = pg and pg:FindFirstChild("MainGUI")
+		local gg = main and main:FindFirstChild("Game")
+		local bags = gg and gg:FindFirstChild("CoinBags")
+		local container = bags and bags:FindFirstChild("Container")
+		if not container then return false end
+		local any = false
+		for _, v in ipairs(container:GetChildren()) do
+			if v:IsA("Frame") and v.Visible then
+				any = true
+				local full = v:FindFirstChild("Full")
+				if not (full and full.Visible) then
+					return false
+				end
+			end
+		end
+		return any
+	end
+
+	local function update_hold()
+		getgenv().AUTOFARM_HOLD = false
+	end
+
+	local function reset_farm_progress(preserve_bag_fling)
+		collected_ids = {}
+		collected_count = 0
+		coins_done = false
+		saw_coins = false
+		farm_target = nil
+		farm_stage_ready = false
+		farm_stage_name = nil
+		farm_stage_position = nil
+		farm_stage_scan_at = 0
+		farm_unknown_teleport_pending = false
+		if not preserve_bag_fling then
+			getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
+		end
+		update_hold()
+	end
+
+	task.spawn(function()
+		local ok, remote = pcall(function()
+			return rs:WaitForChild("Remotes"):WaitForChild("Gameplay"):WaitForChild("CoinsStarted", 15)
+		end)
+		if ok and remote then
+			remote.OnClientEvent:Connect(function() reset_farm_progress(false) end)
+		end
+	end)
+
+	lp.CharacterAdded:Connect(function()
+		reset_farm_progress(getgenv().AUTOFARM_BAG_FLING_ACTIVE)
+	end)
+
+	local function coin_available(v)
+		return v and v.Parent and v:IsA("BasePart") and not v:GetAttribute("Collected") and not v:GetAttribute("Delete")
+	end
+
+	local function normalize_map_name(name)
+		if type(name) ~= "string" then return "" end
+		return string.lower((name:gsub("[^%w]", "")))
+	end
+
+	local set_farm_noclip
+
+	local function find_active_farm_map()
+		local now = os.clock()
+		if now < farm_stage_scan_at and farm_stage_name and farm_stage_position then
+			return farm_stage_name, farm_stage_position
+		end
+		farm_stage_scan_at = now + 0.35
+
+		local found = nil
+		for _, obj in ipairs(workspace:GetDescendants()) do
+			local key = farm_stage_normalized[normalize_map_name(obj.Name)]
+			if key then
+				found = key
+				break
+			end
+		end
+
+		local old_name = farm_stage_name
+		if found then
+			farm_stage_name = found.name
+			farm_stage_position = found.position
+		else
+			farm_stage_name = nil
+			farm_stage_position = nil
+		end
+		if old_name ~= farm_stage_name then
+			farm_stage_ready = false
+			farm_target = nil
+			saw_coins = false
+		end
+		return farm_stage_name, farm_stage_position
+	end
+
+	local function farm_stage_to_map(position)
+		local hrp = farm_hrp()
+		if not hrp or not position then return false end
+		set_farm_noclip(true)
+		pcall(function()
+			hrp.CFrame = CFrame.new(position)
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end)
+		return true
+	end
+
+
+	local function available_coins()
+		local list = {}
+		for _, v in ipairs(cs:GetTagged("CoinVisual")) do
+			if coin_available(v) then
+				list[#list + 1] = v
+			end
+		end
+		return list
+	end
+
+	local function stage_before_coins()
+		local _, position = find_active_farm_map()
+		if not position then return false end
+		if #available_coins() > 0 then
+			farm_stage_ready = true
+			return true
+		end
+		farm_stage_ready = false
+		farm_stage_to_map(position)
+		return false
+	end
+
+	local function nearest_coin(pos, list)
+		local best, bd = nil, math.huge
+		for _, v in ipairs(list) do
+			local d = (v.Position - pos).Magnitude
+			if d < bd then bd = d best = v end
+		end
+		return best
+	end
+
+	set_farm_noclip = function(on)
+		local char = lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if on then
+			if not char then return end
+			if hum then pcall(function() hum.PlatformStand = true end) end
+			for _, p in ipairs(char:GetDescendants()) do
+				if p:IsA("BasePart") and p.CanCollide then
+					if nc_cache[p] == nil then nc_cache[p] = p.CanCollide end
+					p.CanCollide = false
+				end
+			end
+		else
+			if hum then pcall(function() hum.PlatformStand = false end) end
+			for p, v in pairs(nc_cache) do
+				if p and p.Parent then pcall(function() p.CanCollide = v end) end
+			end
+			nc_cache = {}
+		end
+	end
+
+	local up_params = RaycastParams.new()
+	up_params.FilterType = Enum.RaycastFilterType.Exclude
+	up_params.IgnoreWater = true
+
+	local function return_to_surface()
+		local hrp = farm_hrp()
+		if not hrp then return end
+		local origin = hrp.Position
+		up_params.FilterDescendantsInstances = { lp.Character }
+		local res = workspace:Raycast(origin, Vector3.new(0, 400, 0), up_params)
+		local y = res and (res.Position.Y + 5) or (down_ref_y and down_ref_y + 5 or nil)
+		if not y then return end
+		pcall(function()
+			hrp.CFrame = CFrame.new(origin.X, y, origin.Z)
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end)
+	end
+
+	local function farm_release()
+		if was_down then
+			was_down = false
+			return_to_surface()
+		end
+		set_farm_noclip(false)
+	end
+
+	local murder_hrp_cache, murder_hrp_t = nil, 0
+	local function murderer_hrp()
+		local now = os.clock()
+		if now - murder_hrp_t < 0.25 then return murder_hrp_cache end
+		murder_hrp_t = now
+		murder_hrp_cache = nil
+		local d = get_round_data()
+		if type(d) == "table" then
+			local me = d[lp.Name]
+			if me and me.Role == "Murderer" then return nil end
+			for name, info in pairs(d) do
+				if type(info) == "table" and info.Role == "Murderer" and not info.Dead and name ~= lp.Name then
+					local pl = players:FindFirstChild(name)
+					local char = pl and pl.Character
+					local h = char and char:FindFirstChild("HumanoidRootPart")
+					local hum = char and char:FindFirstChildOfClass("Humanoid")
+					if h and (not hum or hum.Health > 0) then murder_hrp_cache = h end
+					break
+				end
+			end
+		end
+		return murder_hrp_cache
+	end
+
+	local function flat_dist(a, b)
+		return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+	end
+
+	local function pick_coin(pos, list, mpos)
+		if not (avoid_murder and mpos) then
+			return nearest_coin(pos, list)
+		end
+		local safe, sd = nil, math.huge
+		local far, fd = nil, -1
+		for _, v in ipairs(list) do
+			local md = flat_dist(v.Position, mpos)
+			if md > fd then fd = md far = v end
+			if md >= AVOID_DIST then
+				local d = (v.Position - pos).Magnitude
+				if d < sd then sd = d safe = v end
+			end
+		end
+		if safe then return safe end
+		if far and fd >= AVOID_DIST * 0.6 then return far end
+		return nil
+	end
+
+	local function coin_ok_now(v, mpos)
+		if not coin_available(v) then return false end
+		if avoid_murder and mpos and flat_dist(v.Position, mpos) < AVOID_DIST * 0.6 then return false end
+		return true
+	end
+
+	local function avoid_steer(cur, dest, mpos)
+		if not (avoid_murder and mpos) then return dest end
+		local dm = flat_dist(cur, mpos)
+		if dm >= AVOID_DIST then return dest end
+		local away = Vector3.new(cur.X - mpos.X, 0, cur.Z - mpos.Z)
+		if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
+		away = away.Unit
+		local want = Vector3.new(dest.X - cur.X, 0, dest.Z - cur.Z)
+		local mag = want.Magnitude
+		if mag < 0.1 then return dest end
+		local weight = 1 + (1 - dm / AVOID_DIST) * 2
+		local blend = (want.Unit + away * weight)
+		if blend.Magnitude < 0.1 then blend = away else blend = blend.Unit end
+		local np = cur + blend * mag
+		return Vector3.new(np.X, dest.Y, np.Z)
+	end
+
+	local function touch_targets(coin)
+		local list = {}
+		local seen = {}
+		local function add(p)
+			if p and not seen[p] and p:IsA("BasePart") and p:FindFirstChildOfClass("TouchTransmitter") then
+				seen[p] = true
+				list[#list + 1] = p
+			end
+		end
+		add(coin)
+		for _, v in ipairs(coin:GetChildren()) do add(v) end
+		local par = coin.Parent
+		if par then
+			if par:IsA("BasePart") then add(par) end
+			for _, v in ipairs(par:GetChildren()) do add(v) end
+		end
+		if #list == 0 then list[1] = coin end
+		return list
+	end
+
+	local function fire_touch(coin)
+		if type(firetouchinterest) ~= "function" then return end
+		if not coin or not coin.Parent then return end
+		local now = os.clock()
+		if now - last_touch < 0.05 then return end
+		last_touch = now
+		local hrp = farm_hrp()
+		if not hrp then return end
+		for _, p in ipairs(touch_targets(coin)) do
+			pcall(firetouchinterest, hrp, p, 0)
+			pcall(firetouchinterest, hrp, p, 1)
+		end
+	end
+
+	local function farm_move(hrp, dest, dt)
+		local dir = dest - hrp.Position
+		local dist = dir.Magnitude
+		local np = dest
+		if dist > 0.1 then
+			np = hrp.Position + dir.Unit * math.min(farm_speed * dt, dist)
+		end
+		local cf = CFrame.new(np)
+		if farm_mode == "Down" then
+			cf = cf * CFrame.Angles(-math.pi * 0.5, 0, 0)
+			was_down = true
+		end
+		pcall(function()
+			hrp.CFrame = cf
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end)
+	end
+
+	local farm_conn = run.Stepped:Connect(function(_, dt)
+		if not autofarm_on then return end
+		if not can_farm() then
+			farm_target = nil
+			was_down = false
+			set_farm_noclip(false)
+			return
+		end
+		local hrp = farm_hrp()
+		if not hrp then return end
+
+		-- The game may force a spawn point immediately after map teleport.
+		-- Keep reapplying the map-specific airborne position until CoinVisuals exist.
+		local stage_name, stage_pos = find_active_farm_map()
+		if not stage_name and not farm_stage_ready and #available_coins() == 0 then
+			-- Unknown-map fallback: teleport to the safe point first, then directly teleport to a map spawn.
+			farm_stage_to_map(farm_unknown_stage_position)
+			if farm_unknown_teleport_pending then return end
+			farm_unknown_teleport_pending = true
+			task.spawn(function()
+				task.wait(0.12)
+				if not autofarm_on then farm_unknown_teleport_pending = false return end
+				local char2 = lp.Character
+				local root2 = char2 and char2:FindFirstChild("HumanoidRootPart")
+				if not root2 then farm_unknown_teleport_pending = false return end
+				local lobby = workspace:FindFirstChild("RegularLobby") or workspace:FindFirstChild("Lobby")
+				local spawnPart
+				for _, obj in ipairs(workspace:GetDescendants()) do
+					if obj:IsA("SpawnLocation") or (obj:IsA("BasePart") and obj.Name == "Spawn") then
+						local inLobby = lobby and obj:IsDescendantOf(lobby)
+						if not inLobby then
+							spawnPart = obj
+							break
+						end
+					end
+				end
+				if spawnPart and spawnPart.Parent then
+					pcall(function()
+						root2.CFrame = spawnPart.CFrame + Vector3.new(0, 4, 0)
+						root2.AssemblyLinearVelocity = Vector3.zero
+						root2.AssemblyAngularVelocity = Vector3.zero
+					end)
+					farm_stage_ready = true
+					set_farm_noclip(false)
+				end
+				farm_unknown_teleport_pending = false
+			end)
+			return
+		end
+		if stage_pos and not farm_stage_ready then
+			if #available_coins() == 0 then
+				stage_before_coins()
+				return
+			end
+			farm_stage_ready = true
+			set_farm_noclip(false)
+			hrp = farm_hrp()
+			if not hrp then return end
+		end
+
+		local list = {}
+		for _, v in ipairs(cs:GetTagged("CoinVisual")) do
+			if v and v.Parent and v:IsA("BasePart") then
+				if v:GetAttribute("Collected") then
+					local id = v:GetAttribute("CoinID")
+					if id and not collected_ids[id] then
+						collected_ids[id] = true
+						collected_count = collected_count + 1
+					end
+				elseif not v:GetAttribute("Delete") then
+					list[#list + 1] = v
+				end
+			end
+		end
+
+		local function finish()
+			farm_target = nil
+			farm_release()
+			if not coins_done then
+				coins_done = true
+				update_hold()
+				if type(getgenv().AUTOFARM_BAG_CALLBACK) == "function" then
+					task.spawn(function() pcall(getgenv().AUTOFARM_BAG_CALLBACK) end)
+				end
+				auto_reset_for_role()
+			end
+		end
+
+		if saw_coins and coin_bags_full() then
+			finish()
+			return
+		end
+
+		if #list > 0 then
+			saw_coins = true
+			if coins_done then coins_done = false update_hold() end
+
+			local mhrp = avoid_murder and murderer_hrp() or nil
+			local mpos = mhrp and mhrp.Position or nil
+
+			if not coin_ok_now(farm_target, mpos) then
+				farm_target = pick_coin(hrp.Position, list, mpos)
+			end
+
+			if farm_target then
+				set_farm_noclip(true)
+				local cpos = farm_target.Position
+				down_ref_y = cpos.Y
+				local dest = cpos
+
+				if farm_mode == "Down" then
+					local xz = flat_dist(hrp.Position, cpos)
+					local safe_to_rise = (not mpos) or flat_dist(hrp.Position, mpos) > RISE_SAFE_DIST
+					if xz <= DOWN_RISE_XZ and safe_to_rise then
+						dest = cpos
+						fire_touch(farm_target)
+					else
+						dest = Vector3.new(cpos.X, cpos.Y - DOWN_DEPTH, cpos.Z)
+					end
+				elseif (cpos - hrp.Position).Magnitude <= 6 then
+					fire_touch(farm_target)
+				end
+
+				dest = avoid_steer(hrp.Position, dest, mpos)
+				farm_move(hrp, dest, dt)
+			elseif mpos then
+				set_farm_noclip(true)
+				local away = Vector3.new(hrp.Position.X - mpos.X, 0, hrp.Position.Z - mpos.Z)
+				if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
+				away = away.Unit
+				local y = hrp.Position.Y
+				if farm_mode == "Down" and down_ref_y then y = down_ref_y - DOWN_DEPTH end
+				farm_move(hrp, hrp.Position + away * 40 + Vector3.new(0, y - hrp.Position.Y, 0), dt)
+			end
+		else
+			farm_target = nil
+			farm_release()
+			if saw_coins and not coins_done and collected_count > 0 then
+				finish()
+			end
+		end
+	end)
+
+
+
+    -- WindUI interface for the original AutoFarm functions.
+    local AutoFarmSection = AutoFarmTab:Section({
+        Title = "Auto Farm",
+        Box = true,
+        Opened = true,
+    })
+
+    AutoFarmSection:Toggle({
+        Title = "Grab Gun",
+        Desc = "Automatically grabs the gun when it drops.",
+        Flag = "Auto Gun",
+        Value = farm_config.grab_gun,
+        Callback = function(v)
+            autograb_on = v
+            farm_config_set("grab_gun", v)
+            if v then
+                if not grab_desc_conn then
+                    grab_desc_conn = workspace.DescendantAdded:Connect(grab_desc_added)
+                end
+                task.spawn(scan_guns)
+            else
+                grab_desc_stop()
+            end
+        end
+    })
+
+    AutoFarmSection:Toggle({
+        Title = "Farm",
+        Desc = "Automatically farms coins.",
+        Flag = "Auto Farm",
+        Value = farm_config.auto_farm,
+        Callback = function(v)
+            autofarm_on = v
+            farm_config_set("auto_farm", v)
+            reset_farm_progress()
+            if not v then
+                farm_release()
+            end
+        end
+    })
+
+    AutoFarmSection:Slider({
+        Title = "Farm Speed",
+        Desc = "Adjusts the movement speed of the coin farm.",
+        Flag = "Farm Speed",
+        Step = 1,
+        Value = {
+            Min = 5,
+            Max = 100,
+            Default = farm_config.farm_speed or 23,
+        },
+        Callback = function(v)
+            farm_speed = tonumber(v) or 23
+            farm_config_set("farm_speed", farm_speed)
+        end
+    })
+
+    AutoFarmSection:Dropdown({
+        Title = "Farm Type",
+        Desc = "Select the farming movement mode.",
+        Values = { "Basic", "Down" },
+        Value = farm_config.farm_type or "Basic",
+        Flag = "Farm Type",
+        Callback = function(v)
+            local nv = type(v) == "table" and v[1] or v
+            if nv ~= "Basic" and nv ~= "Down" then
+                nv = "Basic"
+            end
+            if nv == farm_mode then
+                return
+            end
+
+            farm_mode = nv
+            farm_config_set("farm_type", nv)
+            farm_target = nil
+
+            if farm_mode == "Basic" and was_down then
+                was_down = false
+                return_to_surface()
+            end
+        end
+    })
+
+    AutoFarmSection:Toggle({
+        Title = "Murder Check",
+        Desc = "Avoids the murderer while selecting and approaching coins.",
+        Flag = "Murder Check",
+        Value = farm_config.murder_check,
+        Callback = function(v)
+            avoid_murder = v
+            farm_config_set("murder_check", v)
+            farm_target = nil
+        end
+    })
+
+    AutoFarmSection:Toggle({
+        Title = "Auto Reset as Sheriff",
+        Desc = "Resets after a full coin bag when your role is Sheriff.",
+        Flag = "Auto Reset as Sheriff",
+        Value = farm_config.auto_reset_sheriff,
+        Callback = function(v) autoreset_sheriff_on = v; farm_config_set("auto_reset_sheriff", v) end
+    })
+
+    AutoFarmSection:Toggle({
+        Title = "Auto Reset as Murderer",
+        Desc = "Resets after a full coin bag when your role is Murderer.",
+        Flag = "Auto Reset as Murderer",
+        Value = farm_config.auto_reset_murderer,
+        Callback = function(v) autoreset_murderer_on = v; farm_config_set("auto_reset_murderer", v) end
+    })
+
+    AutoFarmSection:Toggle({
+        Title = "Auto Reset as Innocent",
+        Desc = "Resets after a full coin bag when your role is Innocent.",
+        Flag = "Auto Reset as Innocent",
+        Value = farm_config.auto_reset_innocent,
+        Callback = function(v) autoreset_innocent_on = v; farm_config_set("auto_reset_innocent", v) end
+    })
+
+    getgenv().AUTOFARM_UNLOAD = function()
+        autofarm_on = false
+        autoreset_sheriff_on = false
+        autoreset_murderer_on = false
+        autoreset_innocent_on = false
+        if role_reset_connection then
+            pcall(function() role_reset_connection:Disconnect() end)
+            role_reset_connection = nil
+        end
+        role_reset_busy = false
+        coins_done = false
+        saw_coins = false
+        farm_target = nil
+        getgenv().AUTOFARM_HOLD = false
+        avoid_murder = false
+        farm_mode = "Basic"
+
+        if farm_conn then
+            pcall(function()
+                farm_conn:Disconnect()
+            end)
+            farm_conn = nil
+        end
+
+        farm_release()
+    end
+
+    getgenv().AUTOGRAB_UNLOAD = function()
+        autograb_on = false
+        grab_desc_stop()
+    end
+
+    -- Initialize persisted values in the same scope as the AutoFarm runtime variables.
+    farm_speed = tonumber(farm_config.farm_speed) or 23
+    farm_mode = (farm_config.farm_type == "Down") and "Down" or "Basic"
+    autograb_on = farm_config.grab_gun
+    autofarm_on = farm_config.auto_farm
+    avoid_murder = farm_config.murder_check
+    autoreset_sheriff_on = farm_config.auto_reset_sheriff
+    autoreset_murderer_on = farm_config.auto_reset_murderer
+    autoreset_innocent_on = farm_config.auto_reset_innocent
+    if autograb_on then
+        if not grab_desc_conn then grab_desc_conn = workspace.DescendantAdded:Connect(grab_desc_added) end
+        task.spawn(scan_guns)
+    end
+    reset_farm_progress()
+end
+
+
+-- AutoShoot / Force Shoot logic copied from the supplied source file.
+do
+	local rs = game:GetService("ReplicatedStorage")
+	local players = game:GetService("Players")
+	local collection = game:GetService("CollectionService")
+	local run = game:GetService("RunService")
+	local lp = players.LocalPlayer
+
+	local stats = game:GetService("Stats")
+
+	getgenv().SILENT_S = {
+		enabled = false,
+		predict = false,
+		force = false,
+		auto_on = false,
+		auto_delay = 0,
+		am_sheriff = false,
+		fire_gap = 0,
+		last_shot = 0,
+		stand_off = 15,
+	}
+	local S = getgenv().SILENT_S
+
+	local MAX_RANGE = 300
+
+	local gap_min = 0
+	local gap_seen = false
+	local gap_gun = nil
+	local want_since = 0
+
+	local function gap_reset()
+		gap_min = 0
+		gap_seen = false
+		S.fire_gap = 0
+	end
+
+	local function gap_push(value)
+		if value <= 0 then return end
+		if not gap_seen or value < gap_min then
+			gap_min = value
+			gap_seen = true
+			S.fire_gap = value
+		end
+	end
+
+	local round_mod = nil
+
+	local function get_round()
+		if round_mod then return round_mod end
+		local ok, m = pcall(function()
+			return require(rs:WaitForChild("Modules"):WaitForChild("CurrentRoundClient"))
+		end)
+		if ok and type(m) == "table" then round_mod = m end
+		return round_mod
+	end
+
+	local function holds(container, name)
+		return container ~= nil and container:FindFirstChild(name) ~= nil
+	end
+
+	local function lp_has_gun()
+		return holds(lp.Character, "Gun") or holds(lp:FindFirstChildOfClass("Backpack"), "Gun")
+	end
+
+	local target_player = nil
+	local target_char = nil
+	local target_part = nil
+	local target_hum = nil
+
+	local function refresh_target()
+		local found = nil
+		local m = get_round()
+		local data = m and m.PlayerData or nil
+		if type(data) == "table" then
+			local me = data[lp.Name]
+			S.am_sheriff = (me ~= nil and (me.Role == "Sheriff" or me.Role == "Hero")) or lp_has_gun()
+			for name, d in pairs(data) do
+				if type(d) == "table" and d.Role == "Murderer" and not d.Dead then
+					found = players:FindFirstChild(name)
+					break
+				end
+			end
+		else
+			S.am_sheriff = lp_has_gun()
+		end
+		if not found then
+			for _, plr in ipairs(players:GetPlayers()) do
+				if plr ~= lp and holds(plr.Character, "Knife") then
+					found = plr
+					break
+				end
+			end
+		end
+		if found ~= target_player then
+			target_player = found
+			target_char = nil
+			target_part = nil
+			target_hum = nil
+		end
+		if not found then return end
+		local char = found.Character
+		if char ~= target_char then
+			target_char = char
+			target_part = nil
+			target_hum = nil
+		end
+		if not char then return end
+		if not target_part or not target_part.Parent then
+			target_part = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+		end
+		if not target_hum or not target_hum.Parent then
+			target_hum = char:FindFirstChildOfClass("Humanoid")
+		end
+	end
+
+	local function target_alive()
+		if not target_part or not target_part.Parent then return false end
+		if not target_hum or not target_hum.Parent then return false end
+		return target_hum.Health > 0
+	end
+
+	local ray_params = RaycastParams.new()
+	ray_params.FilterType = Enum.RaycastFilterType.Exclude
+	ray_params.IgnoreWater = false
+
+	local ignore_base = {}
+	local ignore_work = {}
+	local ignore_time = 0
+
+	local function refresh_ignore()
+		local now = os.clock()
+		if #ignore_base > 0 and now - ignore_time < 0.5 then return end
+		ignore_time = now
+		table.clear(ignore_base)
+		local char = lp.Character
+		if char then ignore_base[1] = char end
+		local ok, tagged = pcall(function() return collection:GetTagged("WeaponPassthrough") end)
+		if ok and type(tagged) == "table" then
+			for k = 1, #tagged do
+				ignore_base[#ignore_base + 1] = tagged[k]
+			end
+		end
+	end
+
+	local function trace(origin, direction)
+		refresh_ignore()
+		table.clear(ignore_work)
+		for k = 1, #ignore_base do ignore_work[k] = ignore_base[k] end
+		local result = nil
+		for _ = 1, 6 do
+			ray_params.FilterDescendantsInstances = ignore_work
+			result = workspace:Raycast(origin, direction, ray_params)
+			if not result then break end
+			local inst = result.Instance
+			if not inst then break end
+			local ok, tr = pcall(function() return inst.Transparency end)
+			if not ok or tr ~= 1 then break end
+			ignore_work[#ignore_work + 1] = inst
+		end
+		return result
+	end
+
+	local function gun_attachment()
+		local char = lp.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then return nil, nil end
+		return hrp:FindFirstChild("GunRaycastAttachment"), hrp
+	end
+
+	local function origin_cframe()
+		local att, hrp = gun_attachment()
+		if att then return att.WorldCFrame end
+		if hrp then return hrp.CFrame end
+		return nil
+	end
+
+	local function grav()
+		local ok, g = pcall(function() return workspace.Gravity end)
+		if ok and type(g) == "number" and g > 0 then return g end
+		return 0
+	end
+
+	local P = {
+		snap = 48,
+		ring = 48,
+		hit_r = 2.1,
+		pad = 2.6,
+		min_span = 5,
+		max_span = 90,
+		acc_t = 0.15,
+		acc_max = 280,
+		acc_min = 40,
+		speed_floor = 26,
+		speed_head = 1.3,
+	}
+
+	local snap_t = table.create(P.snap, 0)
+	local snap_p = table.create(P.snap, Vector3.zero)
+	local snap_n = 0
+	local snap_i = 0
+
+	local TR = {
+		part = nil,
+		pos = nil,
+		time = 0,
+		vel = Vector3.zero,
+		gap = 0,
+		ready = false,
+		fresh = Vector3.zero,
+		air = false,
+		air_since = 0,
+		jumping = false,
+		jump_v = 0,
+		fresh_ok = false,
+		turn = 0,
+		spoof = 0,
+		clr = 0,
+		air_edge = 0,
+		jump_fresh = false,
+	}
+
+	local SK = {
+		vt = table.create(P.ring, 0),
+		dx = table.create(P.ring, 0),
+		dz = table.create(P.ring, 0),
+		vn = 0,
+		vi = 0,
+	}
+
+	local EC = {
+		ping = 0,
+		rtt = 0,
+		jitter = 0,
+		seen = false,
+		step = 0,
+		step_seen = false,
+	}
+
+	local function step_push(dt)
+		if dt <= 0 or dt > 0.5 then return end
+		if EC.step_seen then
+			EC.step = EC.step * 0.85 + dt * 0.15
+		else
+			EC.step = dt
+			EC.step_seen = true
+		end
+	end
+
+	local function sample_span()
+		local span = math.max(EC.step, TR.gap)
+		if span <= 0 then return 0 end
+		return span
+	end
+
+	local HY = {
+		pos = {},
+		w = {},
+		n = 0,
+		weight = 0,
+		primary = nil,
+		stamp = 0,
+		conf = 0,
+	}
+
+	local ground_params = RaycastParams.new()
+	ground_params.FilterType = Enum.RaycastFilterType.Exclude
+	ground_params.IgnoreWater = true
+
+	local ground_filter = {}
+	local axis_pool = {}
+
+	local function ground_below(pos, reach)
+		table.clear(ground_filter)
+		local n = 0
+		local char = target_char
+		if char then
+			n = n + 1
+			ground_filter[n] = char
+		end
+		local mine = lp.Character
+		if mine then
+			n = n + 1
+			ground_filter[n] = mine
+		end
+		ground_params.FilterDescendantsInstances = ground_filter
+		local res = workspace:Raycast(pos, Vector3.new(0, -reach, 0), ground_params)
+		if res then return res.Position.Y end
+		return nil
+	end
+
+	local function snap_push(now, pos)
+		snap_i = snap_i % P.snap + 1
+		snap_t[snap_i] = now
+		snap_p[snap_i] = pos
+		if snap_n < P.snap then snap_n = snap_n + 1 end
+	end
+
+	local function snap_get(k)
+		local idx = (snap_i - k - 1) % P.snap + 1
+		return snap_t[idx], snap_p[idx]
+	end
+
+	local function fit_velocity()
+		if snap_n < 3 then return nil end
+		local newest = snap_get(0)
+		local used = 0
+		local sum_d = 0
+		local win = sample_span() * 4
+		for k = 0, snap_n - 1 do
+			local t = snap_get(k)
+			if newest - t > win then break end
+			used = used + 1
+			sum_d = sum_d + t - newest
+		end
+		if used < 3 then return nil end
+		local mean_d = sum_d / used
+		local num = Vector3.zero
+		local den = 0
+		for k = 0, used - 1 do
+			local t, p = snap_get(k)
+			local d = t - newest - mean_d
+			num = num + p * d
+			den = den + d * d
+		end
+		if den < 1e-8 then return nil end
+		return num / den, -mean_d
+	end
+
+	local function recent_velocity()
+		if snap_n < 2 then return nil end
+		local newest, head = snap_get(0)
+		local fallback, fallback_age = nil, nil
+		local target_span = sample_span() * 2
+		local max_span = target_span * 2
+		for k = 1, snap_n - 1 do
+			local t, p = snap_get(k)
+			local dt = newest - t
+			if dt > max_span then break end
+			if dt > 0 then
+				fallback = (head - p) / dt
+				fallback_age = dt * 0.5
+				if dt >= target_span then
+					return fallback, fallback_age
+				end
+			end
+		end
+		return fallback, fallback_age
+	end
+
+	local KIN = {
+		ok = false,
+		ax = 0,
+		az = 0,
+		smax = 0,
+	}
+
+	local function kin_clear()
+		KIN.ok = false
+		KIN.ax = 0
+		KIN.az = 0
+		KIN.smax = 0
+	end
+
+	local function fit_kin()
+		if snap_n < 5 then return nil end
+		local t0 = snap_get(0)
+		local win = math.max(sample_span() * 5, 0.12)
+		local scale = win
+		local n, s1, s2, s3, s4 = 0, 0, 0, 0, 0
+		local bx0, bx1, bx2 = 0, 0, 0
+		local bz0, bz1, bz2 = 0, 0, 0
+		for k = 0, snap_n - 1 do
+			local t, p = snap_get(k)
+			local age = t0 - t
+			if age > win then break end
+			local u = -age / scale
+			local u2 = u * u
+			n = n + 1
+			s1 = s1 + u
+			s2 = s2 + u2
+			s3 = s3 + u2 * u
+			s4 = s4 + u2 * u2
+			bx0 = bx0 + p.X
+			bx1 = bx1 + p.X * u
+			bx2 = bx2 + p.X * u2
+			bz0 = bz0 + p.Z
+			bz1 = bz1 + p.Z * u
+			bz2 = bz2 + p.Z * u2
+		end
+		if n < 5 then return nil end
+		local det = n * (s2 * s4 - s3 * s3)
+			- s1 * (s1 * s4 - s3 * s2)
+			+ s2 * (s1 * s3 - s2 * s2)
+		if math.abs(det) < 1e-9 then return nil end
+		local function solve(b0, b1, b2)
+			local d1 = n * (b1 * s4 - s3 * b2)
+				- b0 * (s1 * s4 - s3 * s2)
+				+ s2 * (s1 * b2 - b1 * s2)
+			local d2 = n * (s2 * b2 - b1 * s3)
+				- s1 * (s1 * b2 - b1 * s2)
+				+ b0 * (s1 * s3 - s2 * s2)
+			return d1 / det, d2 / det
+		end
+		local cx1, cx2 = solve(bx0, bx1, bx2)
+		local cz1, cz2 = solve(bz0, bz1, bz2)
+		local vx, vz = cx1 / scale, cz1 / scale
+		local ax, az = 2 * cx2 / (scale * scale), 2 * cz2 / (scale * scale)
+		if vx ~= vx or vz ~= vz or ax ~= ax or az ~= az then return nil end
+		return Vector3.new(vx, 0, vz), Vector3.new(ax, 0, az)
+	end
+
+	local function kin_update()
+		local kv, ka = fit_kin()
+		if not kv then
+			KIN.ok = false
+			KIN.ax = 0
+			KIN.az = 0
+			return nil
+		end
+		KIN.ok = true
+		local sp = math.sqrt(kv.X * kv.X + kv.Z * kv.Z)
+		if sp > KIN.smax then
+			KIN.smax = sp
+		else
+			KIN.smax = KIN.smax * 0.985 + sp * 0.015
+		end
+		if ka and not TR.air then
+			local am = math.sqrt(ka.X * ka.X + ka.Z * ka.Z)
+			local ax, az = ka.X, ka.Z
+			if am > P.acc_max and am > 0 then
+				ax = ax * P.acc_max / am
+				az = az * P.acc_max / am
+			end
+			KIN.ax = KIN.ax * 0.5 + ax * 0.5
+			KIN.az = KIN.az * 0.5 + az * 0.5
+		else
+			KIN.ax = KIN.ax * 0.5
+			KIN.az = KIN.az * 0.5
+		end
+		return kv
+	end
+
+	local function snap_vel(k)
+		local t0, p0 = snap_get(k)
+		local t1, p1 = snap_get(k + 1)
+		local d = t0 - t1
+		if d <= 0 then return nil end
+		return (p0 - p1) / d, d
+	end
+
+	local function vert_accel()
+		if snap_n < 3 then return nil end
+		local v0, d0 = snap_vel(0)
+		local v1, d1 = snap_vel(1)
+		if not v0 or not v1 then return nil end
+		local span = (d0 + d1) * 0.5
+		if span <= 1e-4 then return nil end
+		return (v0.Y - v1.Y) / span
+	end
+
+	local function air_vy()
+		if snap_n < 2 then return nil end
+		local edge = TR.air_edge
+		if edge <= 0 then return nil end
+		local g = grav()
+		local newest, head = snap_get(0)
+		local want = sample_span() * 2
+		local best = nil
+		for k = 1, snap_n - 1 do
+			local t, p = snap_get(k)
+			if t < edge then break end
+			local dt = newest - t
+			if dt > 1e-4 then
+				best = (head.Y - p.Y) / dt - 0.5 * g * dt
+				if dt >= want then break end
+			end
+		end
+		return best
+	end
+
+	local function body_clearance()
+		local part = target_part
+		local hum = target_hum
+		if not part or not hum then return 0 end
+		local ok, value = pcall(function() return part.Size.Y * 0.5 + hum.HipHeight end)
+		if ok and type(value) == "number" and value > 0 then return value end
+		return 0
+	end
+
+	local GC = {
+		base = 0,
+		seen = false,
+	}
+
+	local JL = {
+		v = 0,
+		seen = false,
+	}
+
+	local function stand_clearance()
+		if GC.seen then return GC.base end
+		return body_clearance()
+	end
+
+	local function engine_vel(part)
+		local ok, v = pcall(function() return part.AssemblyLinearVelocity end)
+		if not ok or typeof(v) ~= "Vector3" then
+			ok, v = pcall(function() return part.Velocity end)
+		end
+		if not ok or typeof(v) ~= "Vector3" then return nil end
+		if v.Magnitude ~= v.Magnitude then return nil end
+		return v
+	end
+
+	local function vel_trust(pv, ev)
+		if not pv or not ev then return 0 end
+		local ph = Vector3.new(pv.X, 0, pv.Z)
+		local eh = Vector3.new(ev.X, 0, ev.Z)
+		local pm, em = ph.Magnitude, eh.Magnitude
+		if pm < 1 and em < 1 then return 1 end
+		if pm < 1 or em < 1 then return 0 end
+		local ratio = em / pm
+		if ratio > 1.5 or ratio < 0.6 then return 0 end
+		local align = ph.Unit:Dot(eh.Unit)
+		if align < 0.7 then return 0 end
+		local a = math.clamp((align - 0.7) / 0.25, 0, 1)
+		local r = 1 - math.clamp(math.abs(ratio - 1) / 0.4, 0, 1)
+		return a * r
+	end
+
+	local function phase_velocity(v, age, air)
+		if not v then return nil end
+		local y = 0
+		if air then
+			y = v.Y - grav() * math.clamp(age or 0, 0, sample_span() * 4)
+		end
+		return Vector3.new(v.X, y, v.Z)
+	end
+
+	local function merge_vel(fit, fit_age, fast, fast_age, engine, engine_age, air)
+		local stable = phase_velocity(fit, fit_age, air)
+		local instant = phase_velocity(fast, fast_age, air)
+		local turn = 0
+		if stable and instant then
+			local sh = Vector3.new(stable.X, 0, stable.Z)
+			local ih = Vector3.new(instant.X, 0, instant.Z)
+			if sh.Magnitude > 1 and ih.Magnitude > 1 then
+				turn = math.acos(math.clamp(sh.Unit:Dot(ih.Unit), -1, 1)) / math.pi
+			end
+		end
+		local base = instant or stable
+		if not base then return Vector3.zero, 0, nil, 0 end
+		if stable and instant then
+			local agility = math.clamp(turn * 2.2, 0, 1)
+			base = stable:Lerp(instant, 0.4 + 0.6 * agility)
+		end
+		local trust = 0
+		if engine then
+			local live = phase_velocity(engine, engine_age, air)
+			trust = vel_trust(base, live)
+			if trust > 0 and air then
+				base = Vector3.new(base.X, base.Y, base.Z):Lerp(Vector3.new(base.X, live.Y, base.Z), trust * 0.35)
+			end
+		end
+		return base, turn, instant or stable, trust
+	end
+
+	local function vel_push(now, hx, hz)
+		SK.vi = SK.vi % P.ring + 1
+		SK.vt[SK.vi] = now
+		SK.dx[SK.vi] = hx
+		SK.dz[SK.vi] = hz
+		if SK.vn < P.ring then SK.vn = SK.vn + 1 end
+	end
+
+	local function track_clear()
+		TR.part = nil
+		TR.pos = nil
+		TR.vel = Vector3.zero
+		TR.gap = 0
+		TR.ready = false
+		TR.fresh = Vector3.zero
+		TR.air = false
+		TR.jumping = false
+		TR.jump_v = 0
+		TR.fresh_ok = false
+		TR.turn = 0
+		TR.spoof = 0
+		TR.clr = 0
+		TR.air_edge = 0
+		TR.jump_fresh = false
+		GC.base = 0
+		GC.seen = false
+		JL.v = 0
+		JL.seen = false
+		snap_n, snap_i = 0, 0
+		SK.vn, SK.vi = 0, 0
+		kin_clear()
+	end
+
+	local function track_seed(part, pos, now)
+		TR.part = part
+		TR.pos = pos
+		TR.time = now
+		TR.vel = Vector3.zero
+		TR.fresh = Vector3.zero
+		TR.fresh_ok = false
+		TR.turn = 0
+		TR.jump_v = 0
+		TR.gap = 0
+		TR.ready = false
+		TR.spoof = 0
+		TR.air_edge = 0
+		TR.jump_fresh = false
+		GC.base = 0
+		GC.seen = false
+		snap_n, snap_i = 0, 0
+		kin_clear()
+		snap_push(now, pos)
+	end
+
+	local function track_fresh(now)
+		local part = target_part
+		if not part or not part.Parent then
+			TR.fresh_ok = false
+			return
+		end
+		local pos = part.Position
+		local g = grav()
+		local sv = snap_vel(0)
+		local vy = sv and sv.Y or 0
+		local accel = vert_accel()
+		local falling = accel ~= nil and accel < -g * 0.5
+		local guess = stand_clearance()
+		local reach = guess + 6 + math.abs(vy) * sample_span() * 4
+		local air
+		local gy = ground_below(pos, reach)
+		if gy then
+			local clr = pos.Y - gy
+			TR.clr = clr
+			if math.abs(vy) < 1 and not falling then
+				if GC.seen then
+					if clr < GC.base then
+						GC.base = GC.base * 0.7 + clr * 0.3
+					else
+						GC.base = GC.base * 0.98 + clr * 0.02
+					end
+				else
+					GC.base = clr
+					GC.seen = true
+				end
+			end
+			local floor = GC.seen and GC.base or guess
+			local tol = math.max(floor * 0.35, 1)
+			air = clr > floor + tol
+			if not air and falling and math.abs(vy) > 4 and clr > floor + 0.35 then
+				air = true
+			end
+		else
+			air = true
+		end
+		if air ~= TR.air then
+			TR.air_edge = now
+			if air then
+				TR.air_since = now
+				TR.jump_fresh = true
+				TR.jump_v = JL.seen and JL.v or math.max(vy, 0)
+			else
+				TR.jump_fresh = false
+				TR.jump_v = 0
+			end
+		end
+		local model_vy = TR.jump_v - g * math.max(0, now - TR.air_since)
+		TR.air = air
+		TR.jumping = air and (vy > 1 or model_vy > 1)
+	end
+
+	local function track(now)
+		local part = target_part
+		if not part or not part.Parent then
+			if TR.part then track_clear() end
+			return
+		end
+		track_fresh(now)
+		local pos = part.Position
+		if part ~= TR.part or not TR.pos then
+			track_seed(part, pos, now)
+			return
+		end
+		local dt = now - TR.time
+		if dt > 0.75 or (pos - TR.pos).Magnitude > 140 then
+			track_seed(part, pos, now)
+			return
+		end
+		if dt <= 0 then return end
+		if (pos - TR.pos).Magnitude == 0 then
+			if TR.gap > 0 and dt >= TR.gap then
+				TR.vel = Vector3.zero
+				TR.fresh = Vector3.zero
+			end
+			return
+		end
+		step_push(dt)
+		TR.gap = dt
+		snap_push(now, pos)
+		TR.pos = pos
+		TR.time = now
+		local fit, fit_age = fit_velocity()
+		local fast, fast_age = recent_velocity()
+		local engine = engine_vel(part)
+		local fresh, turn, instant, trust = merge_vel(fit, fit_age, fast, fast_age, engine, sample_span() * 0.5, TR.air)
+		local kv = kin_update()
+		if kv then
+			fresh = Vector3.new(kv.X, fresh.Y, kv.Z)
+		end
+		if engine and trust <= 0 then
+			if TR.spoof < 20 then TR.spoof = TR.spoof + 1 end
+		elseif TR.spoof > 0 then
+			TR.spoof = TR.spoof - 1
+		end
+		if TR.air then
+			local vy = air_vy()
+			if vy then
+				fresh = Vector3.new(fresh.X, vy, fresh.Z)
+				local since = math.max(0, now - TR.air_edge)
+				if TR.jump_fresh and since <= 0.2 then
+					local impulse = vy + grav() * since
+					if impulse > 1 then
+						if JL.seen then
+							JL.v = JL.v * 0.7 + impulse * 0.3
+						else
+							JL.v = impulse
+							JL.seen = true
+						end
+						if impulse > TR.jump_v then TR.jump_v = impulse end
+					end
+				else
+					TR.jump_fresh = false
+				end
+			end
+		end
+		TR.vel = fresh
+		TR.ready = fit ~= nil or fast ~= nil
+		TR.fresh = TR.vel
+		TR.fresh_ok = TR.ready
+		TR.turn = turn
+		local raw = instant or fresh
+		vel_push(now, raw.X, raw.Z)
+	end
+
+	local function raw_rtt()
+		local a, b
+		local ok, ms = pcall(function()
+			return stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+		if ok and type(ms) == "number" and ms == ms and ms > 4 and ms < 800 then
+			a = ms / 1000
+		end
+		local fine, value = pcall(function() return lp:GetNetworkPing() end)
+		if fine and type(value) == "number" and value == value and value > 0 then
+			local rtt = value * 2
+			if rtt > 0.004 and rtt < 0.8 then b = rtt end
+		end
+		if a and b then return (a + b) * 0.5 end
+		return a or b
+	end
+
+	local function sample_ping()
+		local rtt = raw_rtt()
+		if not rtt or rtt ~= rtt then return end
+		rtt = math.clamp(rtt, 0, 1)
+		if EC.seen then
+			EC.jitter = EC.jitter * 0.9 + math.abs(rtt - EC.rtt) * 0.1
+			EC.rtt = EC.rtt * 0.82 + rtt * 0.18
+		else
+			EC.rtt = rtt
+			EC.jitter = 0
+			EC.seen = true
+		end
+		EC.ping = EC.rtt
+	end
+
+	local function lead_time()
+		if not EC.seen then return 0 end
+		local stale = 0
+		if TR.time > 0 and EC.step_seen then
+			stale = math.clamp(os.clock() - TR.time, 0, EC.step)
+		end
+		return math.clamp(EC.rtt + EC.jitter * 0.5 + stale, 0, 1)
+	end
+
+	local function rotate_y(v, ang)
+		local c, s = math.cos(ang), math.sin(ang)
+		return Vector3.new(v.X * c - v.Z * s, v.Y, v.X * s + v.Z * c)
+	end
+
+	local function dir_stats(win)
+		if SK.vn < 4 then return 1, 0 end
+		win = math.max(win, sample_span() * 3)
+		local newest = SK.vt[SK.vi]
+		local sx, sz, n = 0, 0, 0
+		local prev = nil
+		local turn, turn_n = 0, 0
+		local oldest = newest
+		for k = 0, SK.vn - 1 do
+			local idx = (SK.vi - k - 1) % P.ring + 1
+			local t = SK.vt[idx]
+			if newest - t > win then break end
+			local hx, hz = SK.dx[idx], SK.dz[idx]
+			local m = math.sqrt(hx * hx + hz * hz)
+			if m > 0 then
+				sx = sx + hx / m
+				sz = sz + hz / m
+				n = n + 1
+				local ang = math.atan2(hz, hx)
+				if prev then
+					local d = ang - prev
+					while d > math.pi do d = d - 6.2831853 end
+					while d < -math.pi do d = d + 6.2831853 end
+					turn = turn + d
+					turn_n = turn_n + 1
+				end
+				prev = ang
+				oldest = t
+			end
+		end
+		if n < 2 then return 1, 0 end
+		local coh = math.clamp(math.sqrt(sx * sx + sz * sz) / n, 0, 1)
+		local omega = 0
+		local elapsed = newest - oldest
+		if turn_n >= 1 and elapsed > 1e-3 then
+			omega = -turn / elapsed
+		end
+		return coh, omega
+	end
+
+	local function predict_from(base, sa, sb, fh, now)
+		local span = math.max(0, sa + sb)
+		local g = grav()
+		local dir = fh
+		if dir.Magnitude == 0 then
+			dir = Vector3.new(TR.vel.X, 0, TR.vel.Z)
+		end
+		local x, z
+		if span > 0 and KIN.ok then
+			local age = math.clamp(now - TR.time, 0, sample_span() * 2)
+			local ax, az = KIN.ax, KIN.az
+			if TR.air or math.sqrt(ax * ax + az * az) < P.acc_min then ax, az = 0, 0 end
+			local vx = dir.X + ax * age
+			local vz = dir.Z + az * age
+			local ta = math.min(span, P.acc_t)
+			local dx = vx * span + 0.5 * ax * ta * ta
+			local dz = vz * span + 0.5 * az * ta * ta
+			local reach = math.sqrt(dx * dx + dz * dz)
+			local cap = math.max(KIN.smax * P.speed_head, P.speed_floor) * span
+			if reach > cap and reach > 1e-6 then
+				dx = dx * cap / reach
+				dz = dz * cap / reach
+			end
+			x = base.X + dx
+			z = base.Z + dz
+		else
+			local hspan = span
+			if span > 0 and dir.Magnitude > 0 and not TR.air then
+				local coh, omega = dir_stats(span)
+				local conf = math.clamp(coh, 0, 1) * (1 - math.clamp(TR.turn, 0, 1) * 0.5)
+				if omega ~= 0 then
+					dir = rotate_y(dir, math.clamp(omega * span * 0.5 * conf, -0.6, 0.6))
+				end
+				hspan = span * (0.85 + 0.15 * conf)
+			end
+			x = base.X + dir.X * hspan
+			z = base.Z + dir.Z * hspan
+		end
+		local y = base.Y
+		if TR.air and span > 0 then
+			local vy = TR.vel.Y
+			local phase = math.max(0, now - TR.air_since)
+			local modeled = TR.jump_v - g * phase
+			if TR.jumping and TR.jump_v > 0 and g > 0 and phase <= TR.jump_v / g and modeled > vy then
+				vy = modeled
+			end
+			y = base.Y + vy * span - 0.5 * g * span * span
+			if y < base.Y then
+				local clearance = stand_clearance()
+				local reach = base.Y - y + clearance
+				local gy = ground_below(Vector3.new(x, base.Y, z), reach)
+				if gy then
+					local floor = gy + clearance
+					if y < floor then y = floor end
+				end
+			end
+		end
+		return Vector3.new(x, y, z)
+	end
+
+	local function build_hyps(base, now)
+		table.clear(HY.pos)
+		table.clear(HY.w)
+		local horizon = S.predict and TR.ready and lead_time() or 0
+		local fh = Vector3.new(TR.fresh.X, 0, TR.fresh.Z)
+		HY.primary = predict_from(base, 0, horizon, fh, now)
+		HY.n = 1
+		HY.pos[1] = HY.primary
+		HY.w[1] = 1
+		HY.weight = 1
+		HY.stamp = now
+	end
+
+	local function score_axis(anchor, axis)
+		local covered = 0
+		local lo, hi = 0, 0
+		for k = 1, HY.n do
+			local d = HY.pos[k] - anchor
+			local a = d:Dot(axis)
+			local perp = (d - axis * a).Magnitude
+			if perp <= P.hit_r then
+				covered = covered + HY.w[k]
+				if a < lo then lo = a end
+				if a > hi then hi = a end
+			end
+		end
+		return covered, lo, hi
+	end
+
+	local function corridor_axes(anchor)
+		table.clear(axis_pool)
+		local n = 0
+		local function add(v)
+			if typeof(v) ~= "Vector3" or v.Magnitude < 1e-4 then return end
+			local u = v.Unit
+			for k = 1, n do
+				if axis_pool[k]:Dot(u) > 0.985 then return end
+			end
+			n = n + 1
+			axis_pool[n] = u
+		end
+		local fh = Vector3.new(TR.fresh.X, 0, TR.fresh.Z)
+		if TR.air then add(TR.fresh) end
+		add(fh)
+		for k = 1, HY.n do
+			add(HY.pos[k] - anchor)
+		end
+		add(TR.fresh)
+		add(Vector3.new(0, 1, 0))
+		return n
+	end
+
+	local function build_corridor(now)
+		local part = target_part
+		if not part or not part.Parent then return nil end
+		local base = part.Position
+		build_hyps(base, now)
+		local anchor = HY.primary or base
+		local count = corridor_axes(anchor)
+		local best_axis, best_cov, best_lo, best_hi = nil, -1, 0, 0
+		for k = 1, count do
+			local axis = axis_pool[k]
+			local cov, lo, hi = score_axis(anchor, axis)
+			if cov > best_cov then
+				best_axis, best_cov, best_lo, best_hi = axis, cov, lo, hi
+			end
+		end
+		if not best_axis then return nil end
+		HY.conf = HY.weight > 0 and best_cov / HY.weight or 0
+
+		local pad = P.pad
+		local origin = anchor + best_axis * (best_lo - pad)
+		local aim = anchor + best_axis * (best_hi + pad)
+		if (aim - origin).Magnitude < 4 then
+			origin = anchor - best_axis * 4
+			aim = anchor + best_axis * 4
+		end
+		return origin, aim, HY.conf, anchor
+	end
+
+	local pred_off = Vector3.zero
+	local pred_stamp = 0
+
+	local function lead_offset()
+		local part = target_part
+		if not part or not part.Parent then return Vector3.zero end
+		if not S.predict or not TR.ready then return Vector3.zero end
+		local base = part.Position
+		local now = os.clock()
+		local fh = Vector3.new(TR.fresh.X, 0, TR.fresh.Z)
+		local point = predict_from(base, 0, lead_time(), fh, now)
+		local off = point - base
+		pred_stamp = now
+		pred_off = off
+		return pred_off
+	end
+
+	local function cloud_confidence()
+		local anchor = HY.primary
+		if not anchor or HY.n == 0 or HY.weight <= 0 then return 0 end
+		local covered = 0
+		for k = 1, HY.n do
+			if (HY.pos[k] - anchor).Magnitude <= P.hit_r then
+				covered = covered + HY.w[k]
+			end
+		end
+		return covered / HY.weight
+	end
+	local hit_names = {
+		"HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Head",
+		"RightUpperArm", "LeftUpperArm", "Right Arm", "Left Arm",
+		"RightUpperLeg", "LeftUpperLeg", "Right Leg", "Left Leg",
+		"RightLowerLeg", "LeftLowerLeg",
+	}
+
+	local hit_parts = {}
+	local hit_count = 0
+	local hit_char = nil
+
+	local function refresh_parts()
+		local char = target_char
+		if char == hit_char then return end
+		table.clear(hit_parts)
+		hit_count = 0
+		hit_char = char
+		if not char then return end
+		for k = 1, #hit_names do
+			local part = char:FindFirstChild(hit_names[k])
+			if part and part:IsA("BasePart") then
+				hit_count = hit_count + 1
+				hit_parts[hit_count] = part
+			end
+		end
+	end
+
+	local function los_clear(origin, point)
+		if not origin or not point then return false end
+		local delta = point - origin
+		local dist = delta.Magnitude
+		if dist < 0.5 then return true end
+		if dist > MAX_RANGE then return false end
+		local hit = trace(origin, delta)
+		if not hit then return true end
+		local inst = hit.Instance
+		local char = target_char
+		if inst and char and (inst == char or inst:IsDescendantOf(char)) then return true end
+		return (hit.Position - origin).Magnitude >= dist - 0.75
+	end
+
+	local function pick_point(origin, strict)
+		refresh_parts()
+		if hit_count == 0 then return nil end
+		local off = lead_offset()
+		local first = nil
+		for k = 1, hit_count do
+			local part = hit_parts[k]
+			if not part.Parent then
+				hit_char = nil
+			else
+				local point = part.Position + off
+				if not origin then return point end
+				if not first then first = point end
+				if los_clear(origin, point) then return point end
+			end
+		end
+		if strict then return nil end
+		return first
+	end
+
+	local force_att = nil
+	local force_saved = nil
+	local force_stamp = 0
+
+	local function restore_origin()
+		local att = force_att
+		if not att then return end
+		local saved = force_saved
+		force_att = nil
+		force_saved = nil
+		if saved then
+			pcall(function()
+				if att.Parent then att.CFrame = saved end
+			end)
+		end
+	end
+
+	local function push_origin(cf)
+		local att = gun_attachment()
+		if not att then return false end
+		if force_att and force_att ~= att then restore_origin() end
+		if not force_att then
+			local ok, saved = pcall(function() return att.CFrame end)
+			if not ok or typeof(saved) ~= "CFrame" then return false end
+			force_att = att
+			force_saved = saved
+		end
+		force_stamp = os.clock()
+		local ok = pcall(function() att.WorldCFrame = cf end)
+		if not ok then
+			restore_origin()
+			return false
+		end
+		task.defer(restore_origin)
+		return true
+	end
+
+	local function is_target_hit(inst)
+		local char = target_char
+		if not inst or not char then return false end
+		return inst == char or inst:IsDescendantOf(char)
+	end
+
+	local function force_clear(origin, aim)
+		local hit = trace(origin, aim - origin)
+		if not hit then return false end
+		return is_target_hit(hit.Instance)
+	end
+
+	local function force_velocity()
+		if TR.fresh_ok and TR.fresh.Magnitude > 0.5 then return TR.fresh end
+		if TR.ready and TR.vel.Magnitude > 0.5 then return TR.vel end
+		return Vector3.zero
+	end
+
+	local function resolve_force()
+		local part = target_part
+		if not part or not part.Parent then return nil end
+		local live = part.Position
+		local now = os.clock()
+
+		local origin, aim, conf, anchor = build_corridor(now)
+		if origin and aim then
+			local axis = aim - origin
+			local span = axis.Magnitude
+			if span > 1e-3 then
+				local u = axis / span
+				local mark = anchor or live
+				local behind = (mark - origin):Dot(u)
+				if behind < P.pad then
+					origin = origin - u * (P.pad - behind)
+				end
+				local ahead = (aim - mark):Dot(u)
+				if ahead < P.min_span then
+					aim = mark + u * P.min_span
+				end
+				local want = S.stand_off
+				while want > 0 do
+					local probe = origin - u * want
+					if (aim - probe).Magnitude <= P.max_span
+						and los_clear(probe, mark)
+						and los_clear(probe, live) then
+						origin = probe
+						break
+					end
+					want = want - 3
+				end
+				if (aim - origin).Magnitude > P.max_span then
+					origin = aim - u * P.max_span
+				end
+				return CFrame.new(origin, aim), CFrame.new(aim), conf or 0, mark
+			end
+		end
+
+		local vel = force_velocity()
+		local dir = Vector3.new(0, -1, 0)
+		if vel.Magnitude > 3 then
+			dir = vel.Unit
+		else
+			local mine = origin_cframe()
+			if mine then
+				local delta = live - mine.Position
+				if delta.Magnitude > 2 then dir = delta.Unit end
+			end
+		end
+		local back = live - dir * 6
+		local front = live + dir * math.max(P.min_span, vel.Magnitude * lead_time() + 8)
+		if not force_clear(back, front) then
+			back = live - dir * 2.5
+		end
+		return CFrame.new(back, front), CFrame.new(front), 0, live
+	end
+
+	local function shot_shift(dt)
+		if not S.predict or not TR.ready or dt <= 0 then return Vector3.zero end
+		local shift = Vector3.new(TR.vel.X * dt, 0, TR.vel.Z * dt)
+		if TR.air then
+			local g = grav()
+			local horizon = lead_time()
+			local vy = TR.vel.Y
+			local phase = math.max(0, os.clock() - TR.air_since)
+			local modeled = TR.jump_v - g * phase
+			if TR.jumping and TR.jump_v > 0 and g > 0 and phase <= TR.jump_v / g and modeled > vy then vy = modeled end
+			shift = Vector3.new(shift.X, vy * dt - g * horizon * dt - 0.5 * g * dt * dt, shift.Z)
+		end
+		return shift
+	end
+
+	local function compensate_force(origin_cf, aim_cf, started)
+		local shift = shot_shift(math.max(0, os.clock() - started))
+		if shift == Vector3.zero then return origin_cf, aim_cf end
+		local origin = origin_cf.Position + shift
+		local aim = aim_cf.Position + shift
+		return CFrame.new(origin, aim), CFrame.new(aim)
+	end
+
+	local function resolve_shot()
+		if not S.enabled or not S.am_sheriff or not target_alive() then return nil end
+		if S.force then
+			local started = os.clock()
+			local origin_cf, aim_cf = resolve_force()
+			if origin_cf and aim_cf then
+				origin_cf, aim_cf = compensate_force(origin_cf, aim_cf, started)
+				if push_origin(origin_cf) then return aim_cf end
+			end
+		end
+		local cf = origin_cframe()
+		local aim = pick_point(cf and cf.Position or nil, false)
+		if not aim then return nil end
+		return CFrame.new(aim)
+	end
+
+	local function compensate_resolve(cf)
+		if S.force or typeof(cf) ~= "CFrame" then return cf end
+		return CFrame.new(cf.Position + shot_shift(math.max(0, os.clock() - pred_stamp)))
+	end
+
+	local weapon_service = nil
+	local orig_mouse = nil
+	local orig_screen = nil
+	local hook_mouse = nil
+	local hook_screen = nil
+
+	local function get_weapon_service()
+		if weapon_service then return weapon_service end
+		local ok, m = pcall(function()
+			return require(rs:WaitForChild("ClientServices"):WaitForChild("WeaponService"))
+		end)
+		if ok and type(m) == "table" then weapon_service = m end
+		return weapon_service
+	end
+
+	local function install_hooks()
+		local m = get_weapon_service()
+		if not m then return end
+		if not hook_mouse then
+			local function knife_aim()
+				local fn = getgenv().KNIFE_AIM_RESOLVE
+				if type(fn) ~= "function" then return nil end
+				local ok, cf = pcall(fn)
+				if ok and typeof(cf) == "CFrame" then return cf end
+				return nil
+			end
+			hook_mouse = function(self, ...)
+				sample_ping()
+				local ok, cf = pcall(resolve_shot)
+				if ok and cf then return compensate_resolve(cf) end
+				local kcf = knife_aim()
+				if kcf then return kcf end
+				return orig_mouse(self, ...)
+			end
+			hook_screen = function(self, x, y, ...)
+				sample_ping()
+				local ok, cf = pcall(resolve_shot)
+				if ok and cf then return compensate_resolve(cf) end
+				local kcf = knife_aim()
+				if kcf then return kcf end
+				return orig_screen(self, x, y, ...)
+			end
+		end
+		pcall(function() setreadonly(m, false) end)
+		if type(m.GetMouseTargetCFrame) == "function" and m.GetMouseTargetCFrame ~= hook_mouse then
+			orig_mouse = m.GetMouseTargetCFrame
+			pcall(function() m.GetMouseTargetCFrame = hook_mouse end)
+		end
+		if type(m.GetTargetPosition) == "function" and m.GetTargetPosition ~= hook_screen then
+			orig_screen = m.GetTargetPosition
+			pcall(function() m.GetTargetPosition = hook_screen end)
+		end
+	end
+
+	local gun_fired_conn = nil
+	local last_fire_stamp = 0
+
+	local function on_gun_fired(tool)
+		if typeof(tool) ~= "Instance" then return end
+		local char = lp.Character
+		if not char then return end
+		local ok, mine = pcall(function() return tool:IsDescendantOf(char) end)
+		if not ok or not mine then return end
+		local now = os.clock()
+		if last_fire_stamp > 0 and want_since > 0 and want_since <= last_fire_stamp then
+			gap_push(now - last_fire_stamp)
+		end
+		last_fire_stamp = now
+	end
+
+	local function connect_gun_fired()
+		if gun_fired_conn then return end
+		local m = get_weapon_service()
+		if not m then return end
+		local ev = m.GunFired
+		if typeof(ev) ~= "Instance" then return end
+		gun_fired_conn = ev.OnClientEvent:Connect(function(tool)
+			pcall(on_gun_fired, tool)
+		end)
+	end
+
+	local function get_gun()
+		local char = lp.Character
+		if char then
+			local g = char:FindFirstChild("Gun")
+			if g then return g, true end
+		end
+		local bp = lp:FindFirstChildOfClass("Backpack")
+		if bp then
+			local g = bp:FindFirstChild("Gun")
+			if g then return g, false end
+		end
+		return nil, false
+	end
+
+	local function fire_gun(gun, start_cf, aim_cf)
+		if not gun or not start_cf or not aim_cf then return false end
+		local remote = gun:FindFirstChild("Shoot")
+		if not remote or not remote:IsA("RemoteEvent") then return false end
+		return (pcall(function() remote:FireServer(start_cf, aim_cf) end))
+	end
+
+	local function auto_step(now)
+		if not S.auto_on or not S.enabled or not S.am_sheriff or getgenv().AUTOFARM_HOLD or not target_alive() then
+			want_since = 0
+			return
+		end
+		local gun, equipped = get_gun()
+		if not gun then
+			want_since = 0
+			return
+		end
+		if gun ~= gap_gun then
+			gap_gun = gun
+			gap_reset()
+		end
+		if not equipped then
+			want_since = 0
+			local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+			if hum then pcall(function() hum:EquipTool(gun) end) end
+			return
+		end
+		if want_since == 0 then want_since = now end
+		local hold = S.auto_delay
+		if hold < S.fire_gap then hold = S.fire_gap end
+		local since = last_fire_stamp > 0 and last_fire_stamp or S.last_shot
+		if now - since < hold then return end
+		if S.force then
+			local started = os.clock()
+			local origin_cf, aim_cf = resolve_force()
+			if not origin_cf or not aim_cf then return end
+			origin_cf, aim_cf = compensate_force(origin_cf, aim_cf, started)
+			if fire_gun(gun, origin_cf, aim_cf) then
+				S.last_shot = now
+			end
+			return
+		end
+		local cf = origin_cframe()
+		if not cf then return end
+		local aim = pick_point(cf.Position, true)
+		if not aim then return end
+		local aim_cf = compensate_resolve(CFrame.new(aim))
+		if fire_gun(gun, cf, aim_cf) then
+			S.last_shot = now
+		end
+	end
+
+	local watch_conns = {}
+
+	local function clear_watch()
+		for k = 1, #watch_conns do
+			local conn = watch_conns[k]
+			pcall(function() conn:Disconnect() end)
+		end
+		table.clear(watch_conns)
+	end
+
+	local function setup_watch()
+		clear_watch()
+		local m = get_round()
+		if m and m.PlayerDataChanged then
+			watch_conns[#watch_conns + 1] = m.PlayerDataChanged.Event:Connect(function()
+				pcall(refresh_target)
+			end)
+		end
+		watch_conns[#watch_conns + 1] = lp.CharacterAdded:Connect(function()
+			task.wait(0.3)
+			pcall(refresh_target)
+		end)
+	end
+
+	local next_role = 0
+	local next_hook = 0
+
+	local function tick()
+		if force_att and os.clock() - force_stamp > 0.05 then restore_origin() end
+		if not S.enabled then return end
+		local now = os.clock()
+		if now >= next_role then
+			next_role = now + 0.2
+			refresh_target()
+		end
+		sample_ping()
+		track(now)
+		if now >= next_hook then
+			next_hook = now + 1
+			install_hooks()
+			connect_gun_fired()
+		end
+		auto_step(now)
+		if S.auto_on and (not target_alive()) then
+			S.auto_on = false
+			S.enabled = false
+			S.force = false
+			getgenv().SILENT_AIM_ACTIVE = false
+			restore_origin()
+		end
+	end
+
+	local main_conn = run.Heartbeat:Connect(function()
+		pcall(tick)
+	end)
+
+
+	getgenv().AUTOSHOOT_START = function()
+		S.enabled = true
+		S.auto_on = true
+		S.force = true
+		S.predict = false
+		S.auto_delay = 0
+		getgenv().SILENT_AIM_ACTIVE = true
+		task.spawn(function()
+			pcall(install_hooks)
+			pcall(connect_gun_fired)
+			pcall(setup_watch)
+			pcall(refresh_target)
+		end)
+	end
+
+	getgenv().AUTOSHOOT_STOP = function()
+		S.enabled = false
+		S.auto_on = false
+		S.force = false
+		S.predict = false
+		getgenv().SILENT_AIM_ACTIVE = false
+		restore_origin()
+		clear_watch()
+		track_clear()
+	end
+
+end
+
+-- Extra features below are adapted from the same supplied source file.
+do
+    local Players = game:GetService("Players")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local RunService = game:GetService("RunService")
+    local UserInputService = game:GetService("UserInputService")
+    local VirtualUser = game:GetService("VirtualUser")
+    local CollectionService = game:GetService("CollectionService")
+    local lp = Players.LocalPlayer
+    local ws = workspace
+
+    local kill_all_on = farm_config.kill_all
+    local autoshoot_on = farm_config.autoshoot
+    local anti_afk = farm_config.anti_afk
+    local anti_fling = farm_config.anti_fling
+    local anti_void = farm_config.anti_void
+    local anti_trap = farm_config.anti_trap
+    local disable_render = farm_config.disable_render
+    local fps_cap = tonumber(farm_config.fps_cap) or 60
+
+    -- Kill All: copied from the source kill-aura implementation, but triggered after a full bag.
+    local round_mod = nil
+    local function get_round()
+        if round_mod then return round_mod end
+        local ok, m = pcall(function()
+            return require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("CurrentRoundClient"))
+        end)
+        if ok and type(m) == "table" then round_mod = m end
+        return round_mod
+    end
+
+    local function local_role()
+        local m = get_round()
+        local data = m and m.PlayerData
+        local me = type(data) == "table" and data[lp.Name]
+        return me and me.Role, me
+    end
+
+    local function ensure_knife_equipped()
+        local char = lp.Character
+        if char then
+            local k = char:FindFirstChild("Knife")
+            if k then return k end
+        end
+        local bp = lp:FindFirstChildOfClass("Backpack")
+        local k = bp and bp:FindFirstChild("Knife")
+        if k then
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum then pcall(function() hum:EquipTool(k) end) end
+            task.wait()
+            return lp.Character and lp.Character:FindFirstChild("Knife") or k
+        end
+    end
+
+    local function knife_stab(knife)
+        local events = knife and knife:FindFirstChild("Events")
+        local stabbed = events and events:FindFirstChild("KnifeStabbed")
+        if stabbed then pcall(function() stabbed:FireServer() end) end
+    end
+
+    local function knife_touch(knife, part)
+        local events = knife and knife:FindFirstChild("Events")
+        local touched = events and events:FindFirstChild("HandleTouched")
+        if touched then pcall(function() touched:FireServer(part) end) end
+    end
+
+    local function kill_all()
+        local role, me = local_role()
+        if not (role == "Murderer" and me and not me.Dead) then return end
+        if getgenv().AUTOFARM_HOLD then return end
+        local knife = ensure_knife_equipped()
+        if not knife then return end
+        local victims = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp and plr.Character then
+                local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+                local part = plr.Character:FindFirstChild("HumanoidRootPart") or plr.Character:FindFirstChild("Head")
+                if hum and hum.Health > 0 and part then
+                    victims[#victims + 1] = part
+                end
+            end
+        end
+        if #victims > 0 then
+            knife_stab(knife)
+            for _, part in ipairs(victims) do knife_touch(knife, part) end
+        end
+    end
+
+    -- Anti-AFK from the source.
+    local idle_conn = lp.Idled:Connect(function()
+        if anti_afk then
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end)
+        end
+    end)
+
+    -- Anti-Fling from the source.
+    local fling_cache = {}
+    local fling_reg = {}
+    local fling_conns = {}
+    local FLING_MAX_VEL, FLING_MAX_ANG = 700, 90
+
+    local function fling_kill_part(part)
+        if fling_cache[part] == nil then fling_cache[part] = part.CanCollide end
+        if part.CanCollide then part.CanCollide = false end
+    end
+
+    local function fling_unregister(model)
+        local entry = fling_reg[model]
+        if not entry then return end
+        fling_reg[model] = nil
+        for _, c in ipairs(entry.conns) do pcall(function() c:Disconnect() end) end
+        for part in pairs(entry.parts) do
+            local old = fling_cache[part]
+            fling_cache[part] = nil
+            if old ~= nil and part.Parent then pcall(function() part.CanCollide = old end) end
+        end
+    end
+
+    local function fling_register(model)
+        if not anti_fling or not model or model == lp.Character or fling_reg[model] then return end
+        local entry = {parts = {}, conns = {}}
+        fling_reg[model] = entry
+        local function add(d)
+            if d:IsA("BasePart") and not entry.parts[d] then
+                entry.parts[d] = true
+                pcall(fling_kill_part, d)
+            end
+        end
+        for _, d in ipairs(model:GetDescendants()) do pcall(add, d) end
+        entry.conns[#entry.conns+1] = model.DescendantAdded:Connect(function(d) if anti_fling then pcall(add,d) end end)
+        entry.conns[#entry.conns+1] = model.DescendantRemoving:Connect(function(d) entry.parts[d]=nil; fling_cache[d]=nil end)
+        entry.conns[#entry.conns+1] = model.AncestryChanged:Connect(function(_, parent) if not parent then fling_unregister(model) end end)
+    end
+
+    local function fling_scan()
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= lp and plr.Character then fling_register(plr.Character) end
+        end
+        for _, m in ipairs(ws:GetChildren()) do
+            if m:IsA("Model") and m ~= lp.Character and m:FindFirstChildOfClass("Humanoid") then fling_register(m) end
+        end
+    end
+
+    local function fling_restore()
+        for model in pairs(fling_reg) do fling_unregister(model) end
+        table.clear(fling_reg)
+        for part, old in pairs(fling_cache) do
+            if part.Parent then pcall(function() part.CanCollide = old end) end
+        end
+        table.clear(fling_cache)
+    end
+
+    -- Anti-Void uses the same world-limit behavior as the source.
+    local void_original = ws.FallenPartsDestroyHeight
+    local function set_void(on)
+        anti_void = on
+        pcall(function() ws.FallenPartsDestroyHeight = on and -9e9 or void_original end)
+    end
+
+    -- Anti-Trap copied from the source.
+    local TRAP_LOCK, TRAP_HOLD = 1, 5
+    local trap_window, trap_busy = 0, false
+    local trap_speed_cache, trap_jump_cache = 16, 50
+    local trap_hit_conn
+    local function trap_hum()
+        local c = lp.Character
+        return c and c:FindFirstChildOfClass("Humanoid")
+    end
+    local function trap_kill_gui()
+        local gui = lp:FindFirstChildOfClass("PlayerGui")
+        if not gui then return end
+        for _, child in ipairs(gui:GetChildren()) do
+            if child.Name == "TrapGUI" then pcall(function() child:Destroy() end) end
+        end
+    end
+    local function trap_unlock(hum)
+        if not hum or not hum.Parent then return end
+        pcall(function()
+            if hum.WalkSpeed <= TRAP_LOCK then hum.WalkSpeed = trap_speed_cache end
+            if hum.JumpPower <= TRAP_LOCK then hum.JumpPower = trap_jump_cache end
+        end)
+    end
+    local function trap_engage()
+        if not anti_trap then return end
+        trap_window = os.clock() + TRAP_HOLD
+        local hum = trap_hum()
+        if hum then
+            if hum.WalkSpeed > TRAP_LOCK then trap_speed_cache = hum.WalkSpeed end
+            if hum.JumpPower > TRAP_LOCK then trap_jump_cache = hum.JumpPower end
+        end
+        trap_kill_gui()
+        if trap_busy then return end
+        trap_busy = true
+        task.spawn(function()
+            while anti_trap and os.clock() < trap_window do
+                trap_unlock(trap_hum())
+                trap_kill_gui()
+                RunService.Heartbeat:Wait()
+            end
+            trap_busy = false
+        end)
+    end
+    local function trap_attach()
+        if trap_hit_conn then return end
+        local sys = ReplicatedStorage:FindFirstChild("TrapSystem")
+        local remote = sys and sys:FindFirstChild("TrapHitLocal")
+        if remote then trap_hit_conn = remote.OnClientEvent:Connect(function() task.spawn(trap_engage) end) end
+    end
+    local function trap_detach()
+        if trap_hit_conn then pcall(function() trap_hit_conn:Disconnect() end); trap_hit_conn=nil end
+        trap_window=0
+        trap_unlock(trap_hum())
+    end
+
+    -- Performance: FPS cap is the executor setting used by the source's fake-position code.
+    local function apply_fps()
+        if type(setfpscap) == "function" then pcall(setfpscap, fps_cap) end
+    end
+    local function reset_fps()
+        if type(setfpscap) == "function" then pcall(setfpscap, 0) end
+    end
+
+    -- Roblox's 3D-render toggle is not present in the supplied source; this keeps the option isolated.
+    local function apply_render()
+        pcall(function() RunService:Set3dRenderingEnabled(not disable_render) end)
+    end
+
+    local fling_murder_sheriff_on = farm_config.fling_murderer_sheriff
+    local fling_murder_innocent_on = farm_config.fling_murderer_innocent
+    local role_fling_role = nil
+    local role_fling_thread
+
+    local function role_fling_step()
+        if role_fling_thread then return end
+        role_fling_thread = task.spawn(function()
+            -- This loop survives local death/respawn and ends only when the target Murderer dies,
+            -- the corresponding toggle is disabled, or the bag action is explicitly cancelled.
+            while getgenv().AUTOFARM_BAG_FLING_ACTIVE do
+                local m = get_round()
+                local data = m and m.PlayerData
+                local me = type(data) == "table" and data[lp.Name]
+                local role = role_fling_role or (me and me.Role)
+                local enabled = (role == "Sheriff" and fling_murder_sheriff_on)
+                    or (role == "Innocent" and fling_murder_innocent_on)
+                if not enabled then break end
+
+                local target, target_info
+                if type(data) == "table" then
+                    for name, info in pairs(data) do
+                        if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
+                            target_info = info
+                            target = Players:FindFirstChild(name)
+                            if target then break end
+                        end
+                    end
+                end
+
+                -- Temporary absence (round replication or respawn) is not a reason to stop.
+                if not target then
+                    task.wait(0.1)
+                    continue
+                end
+
+                if target_info and (target_info.Dead == true or target_info.Killed == true) then
+                    break
+                end
+
+                local targetChar = target.Character
+                local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
+                if targetHum and targetHum.Health <= 0 then break end
+
+                -- reset_player_target() simply returns false while our character is dead.
+                -- The outer loop remains alive and retries automatically after respawn.
+                if type(getgenv().AUTOFARM_ROLE_FLING) == "function" and not role_reset_busy then
+                    pcall(getgenv().AUTOFARM_ROLE_FLING, target)
+                end
+                task.wait(0.05)
+            end
+            getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
+            role_fling_thread = nil
+        end)
+    end
+
+    local function post_bag_actions()
+        -- Start role-based Murderer fling only after the farm has confirmed a full bag.
+        getgenv().AUTOFARM_BAG_FLING_ACTIVE = true
+        local bag_role = local_role()
+        if bag_role == "Sheriff" and fling_murder_sheriff_on then
+            role_fling_role = "Sheriff"
+            role_fling_step()
+        elseif bag_role == "Innocent" and fling_murder_innocent_on then
+            role_fling_role = "Innocent"
+            role_fling_step()
+        else
+            role_fling_role = nil
+        end
+        if kill_all_on then pcall(kill_all) end
+        if autoshoot_on then
+            local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                pcall(function()
+                    hrp.CFrame = CFrame.new(134.79, 150.45, 8977.42)
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+            pcall(function() getgenv().AUTOSHOOT_START() end)
+        end
+    end
+    getgenv().AUTOFARM_BAG_CALLBACK = post_bag_actions
+
+    local ExtraSection = AutoFarmTab:Section({Title = "Bag Actions", Box = true, Opened = true})
+
+    ExtraSection:Toggle({
+        Title = "Fling Murderer as Sheriff",
+        Desc = "Continuously flings the Murderer while you are Sheriff.",
+        Flag = "Fling Murderer as Sheriff",
+        Value = farm_config.fling_murderer_sheriff,
+        Callback = function(v)
+            fling_murder_sheriff_on = v
+            farm_config_set("fling_murderer_sheriff", v)
+            if v and getgenv().AUTOFARM_BAG_FLING_ACTIVE then
+                role_fling_role = "Sheriff"
+                role_fling_step()
+            elseif not v and role_fling_role == "Sheriff" then
+                role_fling_role = nil
+            end
+        end,
+    })
+
+    ExtraSection:Toggle({
+        Title = "Fling Murderer as Innocent",
+        Desc = "Continuously flings the Murderer while you are Innocent.",
+        Flag = "Fling Murderer as Innocent",
+        Value = farm_config.fling_murderer_innocent,
+        Callback = function(v)
+            fling_murder_innocent_on = v
+            farm_config_set("fling_murderer_innocent", v)
+            if v and getgenv().AUTOFARM_BAG_FLING_ACTIVE then
+                role_fling_role = "Innocent"
+                role_fling_step()
+            elseif not v and role_fling_role == "Innocent" then
+                role_fling_role = nil
+            end
+        end,
+    })
+
+    ExtraSection:Toggle({
+        Title = "Kill All",
+        Desc = "After a full coin bag, kills all living players if you are the Murderer.",
+        Flag = "Kill All After Bag",
+        Value = farm_config.kill_all,
+        Callback = function(v) kill_all_on = v; farm_config_set("kill_all", v) end,
+    })
+
+    ExtraSection:Toggle({
+        Title = "AutoShoot",
+        Desc = "After a full coin bag, uses the source Force Shoot logic and keeps firing at the Murderer until they die.",
+        Flag = "AutoShoot After Bag",
+        Value = farm_config.autoshoot,
+        Callback = function(v)
+            autoshoot_on = v
+            farm_config_set("autoshoot", v)
+            if not v then
+                pcall(function() getgenv().AUTOSHOOT_STOP() end)
+            end
+        end,
+    })
+
+    local ProtectionSection = AutoFarmTab:Section({Title = "Protection & Performance", Box = true, Opened = true})
+    ProtectionSection:Toggle({Title="Anti-AFK", Flag="Anti-AFK", Value=farm_config.anti_afk, Callback=function(v) anti_afk=v; farm_config_set("anti_afk", v) end})
+    ProtectionSection:Toggle({Title="Anti-Fling", Flag="Anti-Fling", Value=farm_config.anti_fling, Callback=function(v)
+        anti_fling=v
+        farm_config_set("anti_fling", v)
+        if v then fling_scan() else fling_restore() end
+    end})
+    ProtectionSection:Toggle({Title="Anti-Void", Flag="Anti-Void", Value=farm_config.anti_void, Callback=function(v) set_void(v); farm_config_set("anti_void", v) end})
+    ProtectionSection:Toggle({Title="Anti-Trap", Flag="Anti-Trap", Value=farm_config.anti_trap, Callback=function(v)
+        anti_trap=v
+        farm_config_set("anti_trap", v)
+        if v then trap_attach() else trap_detach() end
+    end})
+    ProtectionSection:Toggle({Title="Disable Render", Flag="Disable Render", Value=farm_config.disable_render, Callback=function(v)
+        disable_render=v
+        farm_config_set("disable_render", v)
+        apply_render()
+    end})
+    ProtectionSection:Slider({
+        Title = "FPS Cap",
+        Flag = "FPS Cap",
+        Step = 1,
+        Value = {Min = 15, Max = 240, Default = tonumber(farm_config.fps_cap) or 60},
+        Callback = function(v)
+            fps_cap = tonumber(v) or 60
+            farm_config_set("fps_cap", fps_cap)
+            apply_fps()
+        end
+    })
+
+    -- Persisted AutoFarm settings are initialized in their own scope above.
+    -- Run the same side effects that the callbacks perform.
+    apply_fps()
+    if anti_fling then fling_scan() end
+    if anti_void then set_void(true) end
+    if anti_trap then trap_attach() end
+    if disable_render then apply_render() end
+
+    -- Server hop / persistence settings.
+    local TeleportService = game:GetService("TeleportService")
+    local GuiService = game:GetService("GuiService")
+    local server_hop_kicked = farm_config.server_hop_kicked
+    local server_hop_stuck = farm_config.server_hop_stuck
+    local server_hop_players = farm_config.server_hop_players
+    local server_hop_player_limit = math.clamp(tonumber(farm_config.server_hop_player_limit) or 3, 1, 10)
+    local server_hop_busy = false
+    local server_hop_last_coin = os.clock()
+    local SERVER_STUCK_TIMEOUT = 6 * 60
+
+    local function server_hop_request(url)
+        local request_fn = rawget(getgenv(), "request")
+            or rawget(getgenv(), "http_request")
+            or (syn and syn.request)
+        if type(request_fn) == "function" then
+            local ok, response = pcall(request_fn, {
+                Url = url,
+                Method = "GET",
+                Headers = { ["Content-Type"] = "application/json" },
+            })
+            if ok and type(response) == "table" and type(response.Body) == "string" then
+                return response.Body
+            end
+        end
+
+        local ok, body = pcall(function()
+            return HttpService:GetAsync(url)
+        end)
+        if ok and type(body) == "string" then
+            return body
+        end
+        return nil
+    end
+
+    local function server_hop_find_target(require_more_players)
+        local cursor = ""
+        local best_target = nil
+        local best_players = -1
+
+        for _ = 1, 10 do
+            local url = string.format(
+                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100%s",
+                game.PlaceId,
+                cursor ~= "" and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
+            )
+            local body = server_hop_request(url)
+            if not body then break end
+            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+            if not ok or type(data) ~= "table" then break end
+
+            for _, server in ipairs(data.data or {}) do
+                if type(server) == "table" and server.id and server.id ~= game.JobId then
+                    local playing = tonumber(server.playing) or 0
+                    local max_players = tonumber(server.maxPlayers) or 0
+                    if max_players > 0 and playing < max_players then
+                        -- For the player-count rule, NEVER fall back to an arbitrary
+                        -- low-population server. With a limit of 3, only 4+ players qualify.
+                        if require_more_players then
+                            if playing > server_hop_player_limit and playing > best_players then
+                                best_target = server.id
+                                best_players = playing
+                            end
+                        else
+                            return server.id
+                        end
+                    end
+                end
+            end
+
+            cursor = tostring(data.nextPageCursor or "")
+            if cursor == "" then break end
+        end
+
+        if require_more_players then
+            return best_target
+        end
+        return nil
+    end
+
+    -- Public raw GitHub source used by queue_on_teleport after server changes.
+    local FARM_SCRIPT_URL = "https://raw.githubusercontent.com/mysllff/Autofrm/refs/heads/main/Mm222"
+
+    local function queueScript(code, data)
+        local queue_fn = (type(queue_on_teleport) == "function" and queue_on_teleport)
+            or (type(queueonteleport) == "function" and queueonteleport)
+            or (syn and type(syn.queue_on_teleport) == "function" and syn.queue_on_teleport)
+            or (fluxus and type(fluxus.queue_on_teleport) == "function" and fluxus.queue_on_teleport)
+
+        if type(queue_fn) ~= "function" then
+            warn("[queue] executor does not support queue_on_teleport")
+            return false
+        end
+
+        local chunks = {}
+        if data then
+            local ok_encode, encoded = pcall(function()
+                return HttpService:JSONEncode(data)
+            end)
+            if not ok_encode then
+                warn("[queue] failed to encode server-hop state")
+                return false
+            end
+            chunks[#chunks + 1] = string.format(
+                "getgenv().__QUEUE_DATA = %s;",
+                string.format("%q", encoded)
+            )
+        end
+        chunks[#chunks + 1] = code
+
+        local ok_queue = pcall(queue_fn, table.concat(chunks, "\n"))
+        if not ok_queue then
+            warn("[queue] failed to queue teleport script")
+            return false
+        end
+        return true
+    end
+
+    local function queue_server_hop_script()
+        local state = {
+            server_hop_kicked = server_hop_kicked,
+            server_hop_stuck = server_hop_stuck,
+            server_hop_players = server_hop_players,
+            server_hop_player_limit = server_hop_player_limit,
+        }
+
+        local loader = string.format([[
+            task.spawn(function()
+                if not game:IsLoaded() then
+                    game.Loaded:Wait()
+                end
+
+                local ok, source = pcall(function()
+                    return game:HttpGet(%q)
+                end)
+                if not ok or type(source) ~= "string" or #source == 0 then
+                    warn("[queue] failed to download AutoFarm from GitHub: " .. tostring(source))
+                    return
+                end
+
+                local fn, compile_error = loadstring(source, "@AutoFarm_WindUI.lua")
+                if not fn then
+                    warn("[queue] failed to compile AutoFarm source: " .. tostring(compile_error))
+                    return
+                end
+
+                local run_ok, run_error = pcall(fn)
+                if not run_ok then
+                    warn("[queue] AutoFarm failed after teleport: " .. tostring(run_error))
+                end
+            end)
+        ]], FARM_SCRIPT_URL)
+
+        return queueScript(loader, state)
+    end
+
+    -- Restore queued state early when the script starts in a new server.
+    do
+        local queued_state = getgenv().__QUEUE_DATA
+        if type(queued_state) == "string" and queued_state ~= "" then
+            local ok, data = pcall(function()
+                return HttpService:JSONDecode(queued_state)
+            end)
+            if ok and type(data) == "table" then
+                if type(data.server_hop_kicked) == "boolean" then server_hop_kicked = data.server_hop_kicked end
+                if type(data.server_hop_stuck) == "boolean" then server_hop_stuck = data.server_hop_stuck end
+                if type(data.server_hop_players) == "boolean" then server_hop_players = data.server_hop_players end
+                if type(data.server_hop_player_limit) == "number" then
+                    server_hop_player_limit = math.clamp(data.server_hop_player_limit, 1, 10)
+                end
+            end
+            getgenv().__QUEUE_DATA = nil
+        end
+    end
+
+    local function perform_server_hop(reason)
+        if server_hop_busy then return false end
+        server_hop_busy = true
+
+        -- Queue the script before every teleport so the new server automatically
+        -- restores the AutoFarm UI and all persisted settings.
+        queue_server_hop_script()
+
+        -- When the player-count rule caused the hop, prefer a server above the configured limit.
+        local require_more_players = reason == "players"
+        local target = server_hop_find_target(require_more_players)
+        if target then
+            local ok = pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, target, lp)
+            end)
+            if ok then return true end
+        elseif require_more_players then
+            -- Do not use generic Teleport here: it can put us into another
+            -- one-player server and defeats the configured player-count rule.
+            warn("[server hop] no public server found above the player limit")
+            server_hop_busy = false
+            return false
+        end
+
+        -- Generic fallback is only allowed for manual/kicked/stuck hops.
+        local ok = pcall(function()
+            TeleportService:Teleport(game.PlaceId, lp)
+        end)
+        if ok then return true end
+
+        server_hop_busy = false
+        return false
+    end
+
+    local function reset_server_hop_coin_timer()
+        server_hop_last_coin = os.clock()
+    end
+
+    -- A coin appearing anywhere in the round means the game is no longer considered stuck.
+    local server_coin_added_conn = CollectionService:GetInstanceAddedSignal("CoinVisual"):Connect(function()
+        reset_server_hop_coin_timer()
+    end)
+
+    local server_desc_coin_conn = ws.DescendantAdded:Connect(function(obj)
+        if obj:IsA("BasePart") and (obj.Name == "Coin" or obj.Name == "CoinVisual") then
+            reset_server_hop_coin_timer()
+        end
+    end)
+
+    -- Kicks/disconnect messages are exposed through GuiService before the client leaves.
+    local server_kick_conn = GuiService.ErrorMessageChanged:Connect(function(message)
+        if not server_hop_kicked or server_hop_busy then return end
+        local text_message = string.lower(tostring(message or ""))
+        if text_message:find("kick", 1, true)
+            or text_message:find("disconnect", 1, true)
+            or text_message:find("removed from the game", 1, true) then
+            task.defer(function()
+                perform_server_hop("kicked")
+            end)
+        end
+    end)
+
+    local teleport_failed_conn = TeleportService.TeleportInitFailed:Connect(function()
+        server_hop_busy = false
+    end)
+
+    local SettingsSection = SettingsTab:Section({
+        Title = "Server Hop",
+        Box = true,
+        Opened = true,
+    })
+
+    SettingsSection:Toggle({
+        Title = "Server Hop if Kicked",
+        Desc = "Attempts to join another public server when a kick/disconnect message is detected.",
+        Flag = "Server Hop if Kicked",
+        Value = server_hop_kicked,
+        Callback = function(v)
+            server_hop_kicked = v
+            farm_config_set("server_hop_kicked", v)
+        end,
+    })
+
+    SettingsSection:Toggle({
+        Title = "Server Hop if Game Stuck",
+        Desc = "Hops after 6 minutes without seeing a coin.",
+        Flag = "Server Hop if Game Stuck",
+        Value = server_hop_stuck,
+        Callback = function(v)
+            server_hop_stuck = v
+            server_hop_last_coin = os.clock()
+            farm_config_set("server_hop_stuck", v)
+        end,
+    })
+
+    SettingsSection:Toggle({
+        Title = "Server Hop if Player Count is Low",
+        Desc = "Hops when the server has the selected number of players or fewer.",
+        Flag = "Server Hop if Players",
+        Value = server_hop_players,
+        Callback = function(v)
+            server_hop_players = v
+            farm_config_set("server_hop_players", v)
+        end,
+    })
+
+    SettingsSection:Slider({
+        Title = "Player Count Limit",
+        Desc = "Server hop when the current player count is at or below this number.",
+        Flag = "Server Hop Player Limit",
+        Step = 1,
+        Value = {
+            Min = 1,
+            Max = 10,
+            Default = math.clamp(server_hop_player_limit, 1, 10),
+        },
+        Callback = function(v)
+            server_hop_player_limit = math.clamp(tonumber(v) or 3, 1, 10)
+            farm_config_set("server_hop_player_limit", server_hop_player_limit)
+        end,
+    })
+
+    SettingsSection:Button({
+        Title = "Server Hop",
+        Desc = "Manually joins another public server for testing or emergency use.",
+        Callback = function()
+            perform_server_hop("manual")
+        end,
+    })
+
+    local settings_monitor_conn = RunService.Heartbeat:Connect(function()
+        if server_hop_busy then return end
+
+        if server_hop_players and #Players:GetPlayers() <= server_hop_player_limit then
+            perform_server_hop("players")
+            return
+        end
+
+        if server_hop_stuck and os.clock() - server_hop_last_coin >= SERVER_STUCK_TIMEOUT then
+            perform_server_hop("stuck")
+            return
+        end
+    end)
+
+    local fling_step = RunService.Stepped:Connect(function()
+        if not anti_fling then return end
+        if next(fling_reg) == nil then fling_scan() end
+        for model, entry in pairs(fling_reg) do
+            if not model.Parent then
+                fling_unregister(model)
+            else
+                for part in pairs(entry.parts) do
+                    if part.Parent then
+                        if part.CanCollide then pcall(function() part.CanCollide=false end) end
+                    else entry.parts[part]=nil end
+                end
+            end
+        end
+        local char=lp.Character
+        local hrp=char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local lin=hrp.AssemblyLinearVelocity
+            local ang=hrp.AssemblyAngularVelocity
+            if lin.Magnitude>FLING_MAX_VEL or ang.Magnitude>FLING_MAX_ANG then
+                hrp.AssemblyLinearVelocity=Vector3.zero
+                hrp.AssemblyAngularVelocity=Vector3.zero
+            end
+        end
+    end)
+
+    getgenv().AUTOFARM_EXTRAS_UNLOAD = function()
+        pcall(function() getgenv().AUTOSHOOT_STOP() end)
+        kill_all_on=false
+        autoshoot_on=false
+        fling_murder_sheriff_on=false
+        fling_murder_innocent_on=false
+        role_fling_role=nil
+        getgenv().AUTOFARM_BAG_FLING_ACTIVE=false
+        if role_fling_thread then pcall(task.cancel, role_fling_thread); role_fling_thread=nil end
+        anti_afk=false
+        anti_fling=false
+        anti_trap=false
+        set_void(false)
+        disable_render=false
+        pcall(apply_render)
+        trap_detach()
+        fling_restore()
+        reset_fps()
+        if idle_conn then pcall(function() idle_conn:Disconnect() end); idle_conn=nil end
+        if fling_step then pcall(function() fling_step:Disconnect() end); fling_step=nil end
+        if settings_monitor_conn then pcall(function() settings_monitor_conn:Disconnect() end); settings_monitor_conn=nil end
+        if server_coin_added_conn then pcall(function() server_coin_added_conn:Disconnect() end); server_coin_added_conn=nil end
+        if server_desc_coin_conn then pcall(function() server_desc_coin_conn:Disconnect() end); server_desc_coin_conn=nil end
+        if server_kick_conn then pcall(function() server_kick_conn:Disconnect() end); server_kick_conn=nil end
+        if teleport_failed_conn then pcall(function() teleport_failed_conn:Disconnect() end); teleport_failed_conn=nil end
+        getgenv().AUTOFARM_BAG_CALLBACK=nil
+    end
+end
