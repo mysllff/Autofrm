@@ -1,6 +1,86 @@
 -- AutoFarm extracted from the supplied script and adapted to WindUI.
 -- Official WindUI repository: https://github.com/Footagesus/WindUI
 
+-- Automatically restore the device marked as "Previous Device" after a rejoin/server hop.
+-- Prefer the game's ChangeLastDevice RemoteEvent, then fall back to clicking the matching card.
+task.spawn(function()
+    local Players = game:GetService("Players")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local player = Players.LocalPlayer
+    local selected = false
+    local deadline = os.clock() + 45
+
+    local function findPreviousDevice(playerGui)
+        for _, label in ipairs(playerGui:GetDescendants()) do
+            if label:IsA("TextLabel") and string.find(string.lower(label.Text or ""), "previous device", 1, true) then
+                local node = label
+                for _ = 1, 8 do
+                    if not node or node == playerGui then break end
+                    for _, item in ipairs(node:GetDescendants()) do
+                        if item:IsA("TextLabel") or item:IsA("TextButton") then
+                            local value = string.lower((item.Text or ""):gsub("%s+", " "))
+                            if value == "tablet" then return "Tablet", label end
+                            if value == "phone" then return "Phone", label end
+                        end
+                    end
+                    node = node.Parent
+                end
+                -- Screenshot's Previous Device card is Tablet; use it if the card text isn't discoverable.
+                return "Tablet", label
+            end
+        end
+        return nil, nil
+    end
+
+    local function trySelectPreviousDevice()
+        if selected or os.clock() > deadline then return selected end
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        if not playerGui then return false end
+
+        local device, previousLabel = findPreviousDevice(playerGui)
+        if not device then return false end
+
+        -- This is the game's own device-selection remote shown in the supplied example.
+        local remote
+        pcall(function()
+            remote = ReplicatedStorage:WaitForChild("Remotes", 2)
+                :WaitForChild("Extras", 2)
+                :WaitForChild("ChangeLastDevice", 2)
+        end)
+        if remote and remote:IsA("RemoteEvent") then
+            local ok = pcall(function() remote:FireServer(device) end)
+            if ok then
+                selected = true
+                return true
+            end
+        end
+
+        -- Fallback: invoke the GUI card's existing handlers when the executor exposes getconnections.
+        if type(getconnections) == "function" and previousLabel then
+            local node = previousLabel.Parent
+            for _ = 1, 8 do
+                if not node or node == playerGui then break end
+                if node:IsA("GuiButton") then
+                    local ok = pcall(function()
+                        for _, connection in ipairs(getconnections(node.Activated)) do
+                            if connection.Function then connection.Function() end
+                        end
+                    end)
+                    if ok then selected = true; return true end
+                end
+                node = node.Parent
+            end
+        end
+        return false
+    end
+
+    while not selected and os.clock() <= deadline do
+        if trySelectPreviousDevice() then break end
+        task.wait(0.5)
+    end
+    if not selected then warn("[device] could not automatically restore Previous Device") end
+end)
+
 local WindUI = loadstring(game:HttpGet(
     "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
 ))()
