@@ -1,3 +1,13 @@
+-- Prevent duplicate queued executions from stacking UI and worker loops in the same server.
+do
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    local jobId = tostring(game.JobId or "")
+    if jobId ~= "" and env.__AUTOFARM_RUNNING_JOB == jobId then
+        return
+    end
+    env.__AUTOFARM_RUNNING_JOB = jobId
+end
+
 -- Restore the last device selection after a rejoin/server hop.
 -- This follows the game's DeviceSelect GUI and ChangeLastDevice remote.
 task.spawn(function()
@@ -788,6 +798,13 @@ do
 		end
 
 		local function finish()
+			-- Never trigger post-bag actions just because no coins are currently visible.
+			-- The actual in-game bag UI must explicitly report full first.
+			if not coin_bags_full() then
+				farm_target = nil
+				farm_release()
+				return
+			end
 			farm_target = nil
 			farm_release()
 			if not coins_done then
@@ -917,11 +934,16 @@ do
     AutoFarmSection:Dropdown({
         Title = "Farm Type",
         Desc = "Select the farming movement mode.",
-        Values = { "Basic", "Down" },
-        Value = farm_config.farm_type or "Basic",
+        Values = { "stand", "underground" },
+        Value = (farm_config.farm_type == "Down") and "underground" or "stand",
         Flag = "Farm Type",
         Callback = function(v)
             local nv = type(v) == "table" and v[1] or v
+            if nv == "underground" then
+                nv = "Down"
+            elseif nv == "stand" then
+                nv = "Basic"
+            end
             if nv ~= "Basic" and nv ~= "Down" then
                 nv = "Basic"
             end
@@ -941,9 +963,9 @@ do
     })
 
     AutoFarmSection:Toggle({
-        Title = "Murder Check",
+        Title = "Avoid murder",
         Desc = "Avoids the murderer while selecting and approaching coins.",
-        Flag = "Murder Check",
+        Flag = "Avoid murder",
         Value = farm_config.murder_check,
         Callback = function(v)
             avoid_murder = v
@@ -2739,19 +2761,26 @@ do
                     end
                 end
 
-                -- Temporary absence (round replication or respawn) is not a reason to stop.
-                if not target then
-                    task.wait(0.1)
+                -- Do not fling during the lobby/device-selection phase. Require valid role
+                -- data for both players and a live Murderer character before engaging.
+                local valid_local_role = me and (me.Role == "Sheriff" or me.Role == "Innocent")
+                if not valid_local_role or not target or not target_info
+                    or target_info.Role ~= "Murderer" then
+                    task.wait(0.25)
                     continue
                 end
 
-                if target_info and (target_info.Dead == true or target_info.Killed == true) then
+                if target_info.Dead == true or target_info.Killed == true then
                     break
                 end
 
                 local targetChar = target.Character
                 local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
-                if targetHum and targetHum.Health <= 0 then break end
+                local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+                if not targetHum or targetHum.Health <= 0 or not targetRoot then
+                    task.wait(0.25)
+                    continue
+                end
 
                 -- reset_player_target() simply returns false while our character is dead.
                 -- The outer loop remains alive and retries automatically after respawn.
@@ -2766,7 +2795,12 @@ do
     end
 
     local function post_bag_actions()
-        -- Start role-based Murderer fling only after the farm has confirmed a full bag.
+        -- Hard safety gate: no fling/kill/shoot actions unless the visible coin bag is full.
+        if not coin_bags_full() then
+            getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
+            role_fling_role = nil
+            return
+        end
         getgenv().AUTOFARM_BAG_FLING_ACTIVE = true
         local bag_role = local_role()
         if bag_role == "Sheriff" and fling_murder_sheriff_on then
@@ -2803,10 +2837,7 @@ do
         Callback = function(v)
             fling_murder_sheriff_on = v
             farm_config_set("fling_murderer_sheriff", v)
-            if v and getgenv().AUTOFARM_BAG_FLING_ACTIVE then
-                role_fling_role = "Sheriff"
-                role_fling_step()
-            elseif not v and role_fling_role == "Sheriff" then
+            if not v and role_fling_role == "Sheriff" then
                 role_fling_role = nil
             end
         end,
@@ -2820,10 +2851,7 @@ do
         Callback = function(v)
             fling_murder_innocent_on = v
             farm_config_set("fling_murderer_innocent", v)
-            if v and getgenv().AUTOFARM_BAG_FLING_ACTIVE then
-                role_fling_role = "Innocent"
-                role_fling_step()
-            elseif not v and role_fling_role == "Innocent" then
+            if not v and role_fling_role == "Innocent" then
                 role_fling_role = nil
             end
         end,
