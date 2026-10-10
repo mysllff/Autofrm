@@ -2742,10 +2742,15 @@ do
             -- This loop survives local death/respawn and ends only when the target Murderer dies,
             -- the corresponding toggle is disabled, or the bag action is explicitly cancelled.
             while getgenv().AUTOFARM_BAG_FLING_ACTIVE do
-                local m = get_round()
-                local data = m and m.PlayerData
+                -- Use the same round-data accessor as the farm logic so role detection
+                -- does not depend on a second cached module reference.
+                if not coin_bags_full() then
+                    task.wait(0.25)
+                    continue
+                end
+                local data = get_round_data()
                 local me = type(data) == "table" and data[lp.Name]
-                local role = role_fling_role or (me and me.Role)
+                local role = me and me.Role
                 local enabled = (role == "Sheriff" and fling_murder_sheriff_on)
                     or (role == "Innocent" and fling_murder_innocent_on)
                 if not enabled then break end
@@ -2784,8 +2789,11 @@ do
 
                 -- reset_player_target() simply returns false while our character is dead.
                 -- The outer loop remains alive and retries automatically after respawn.
-                if type(getgenv().AUTOFARM_ROLE_FLING) == "function" and not role_reset_busy then
-                    pcall(getgenv().AUTOFARM_ROLE_FLING, target)
+                if type(getgenv().AUTOFARM_ROLE_FLING) == "function" then
+                    -- Let the fling routine itself report busy/invalid state; don't
+                    -- permanently suppress attempts because another role action was busy.
+                    local ok, result = pcall(getgenv().AUTOFARM_ROLE_FLING, target)
+                    if not ok then warn("[AutoFarm] role fling error: " .. tostring(result)) end
                 end
                 task.wait(0.05)
             end
