@@ -523,10 +523,11 @@ do
 	local function farm_stage_to_map(position)
 		local hrp = farm_hrp()
 		if not hrp or not position then return false end
-		-- Reapply only when displaced or after a short interval; writing CFrame every
-		-- Stepped frame caused a teleport/physics loop and severe client lag.
+		-- Teleport to the map staging point only when actually displaced. The unknown-map
+		-- fallback is intentionally retained, but repeatedly snapping back to it every
+		-- 0.35s caused physics churn and lag. Allow small drift while waiting for the round.
 		local now = os.clock()
-		if (hrp.Position - position).Magnitude < 2 or now - farm_stage_last_tp < 0.35 then
+		if (hrp.Position - position).Magnitude < 12 or (farm_stage_last_tp > 0 and now - farm_stage_last_tp < 1.0) then
 			return true
 		end
 		farm_stage_last_tp = now
@@ -3007,36 +3008,33 @@ do
     end
 
     local function server_hop_find_target(require_more_players)
+        -- The configured player limit is the trigger for leaving the CURRENT server,
+        -- not a minimum population requirement for the destination. The old code
+        -- required the destination to have more players than the limit, which often
+        -- returned no result and printed "no public server found".
+        local candidates = {}
+        local seen = {}
         local cursor = ""
-        local best_target = nil
-        local best_players = -1
 
-        for _ = 1, 10 do
+        for _ = 1, 5 do
             local url = string.format(
-                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100%s",
+                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true%s",
                 game.PlaceId,
                 cursor ~= "" and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
             )
             local body = server_hop_request(url)
             if not body then break end
             local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-            if not ok or type(data) ~= "table" then break end
+            if not ok or type(data) ~= "table" or type(data.data) ~= "table" then break end
 
-            for _, server in ipairs(data.data or {}) do
-                if type(server) == "table" and server.id and server.id ~= game.JobId then
-                    local playing = tonumber(server.playing) or 0
-                    local max_players = tonumber(server.maxPlayers) or 0
-                    if max_players > 0 and playing < max_players then
-                        -- For the player-count rule, NEVER fall back to an arbitrary
-                        -- low-population server. With a limit of 3, only 4+ players qualify.
-                        if require_more_players then
-                            if playing > server_hop_player_limit and playing > best_players then
-                                best_target = server.id
-                                best_players = playing
-                            end
-                        else
-                            return server.id
-                        end
+            for _, server in ipairs(data.data) do
+                if type(server) == "table" and type(server.id) == "string"
+                    and server.id ~= "" and server.id ~= game.JobId and not seen[server.id] then
+                    local playing = tonumber(server.playing)
+                    local max_players = tonumber(server.maxPlayers)
+                    if playing and max_players and max_players > 0 and playing < max_players then
+                        seen[server.id] = true
+                        candidates[#candidates + 1] = server.id
                     end
                 end
             end
@@ -3045,10 +3043,8 @@ do
             if cursor == "" then break end
         end
 
-        if require_more_players then
-            return best_target
-        end
-        return nil
+        if #candidates == 0 then return nil end
+        return candidates[math.random(1, #candidates)]
     end
 
     -- Public raw GitHub source used by queue_on_teleport after server changes.
@@ -3154,23 +3150,19 @@ do
         -- restores the AutoFarm UI and all persisted settings.
         queue_server_hop_script()
 
-        -- When the player-count rule caused the hop, prefer a server above the configured limit.
-        local require_more_players = reason == "players"
-        local target = server_hop_find_target(require_more_players)
+        -- The player-count limit triggers leaving this server; destinations can have any non-full population.
+        local target = server_hop_find_target(reason == "players")
         if target then
             local ok = pcall(function()
                 TeleportService:TeleportToPlaceInstance(game.PlaceId, target, lp)
             end)
             if ok then return true end
-        elseif require_more_players then
-            -- Do not use generic Teleport here: it can put us into another
-            -- one-player server and defeats the configured player-count rule.
-            warn("[server hop] no public server found above the player limit")
-            server_hop_busy = false
-            return false
+        else
+            warn("[server hop] public-server lookup failed or returned no candidates; trying Roblox matchmaking")
         end
 
-        -- Generic fallback is only allowed for manual/kicked/stuck hops.
+        -- If the public-server API is unavailable/rate-limited, let Roblox matchmaking
+        -- choose a destination instead of leaving Server Hop permanently stuck.
         local ok = pcall(function()
             TeleportService:Teleport(game.PlaceId, lp)
         end)
