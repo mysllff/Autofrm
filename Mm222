@@ -329,6 +329,27 @@ do
 	local role_reset_busy = false
 	local role_reset_connection = nil
 
+	-- Restore the local character the same way the supplied used.lua reset routine does.
+	local function restore_role_reset_character(character, saved_cframe)
+		if not character or not saved_cframe then return end
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not root then return end
+		humanoid.PlatformStand = false
+		for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do
+			pcall(function() track:Stop() end)
+		end
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		root.Velocity = Vector3.zero
+		root.RotVelocity = Vector3.zero
+		root.CFrame = saved_cframe
+		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		for _, part in ipairs(character:GetDescendants()) do
+			if part:IsA("BasePart") then part.CanCollide = true end
+		end
+	end
+
 	local function reset_player_target(target)
 		if not target or target == lp or role_reset_busy then return false end
 		local character = lp.Character
@@ -360,12 +381,8 @@ do
 				workspace.FallenPartsDestroyHeight = old_destroy_height
 				bv:Destroy()
 				bg:Destroy()
-				if character.Parent and root.Parent then
-					root.CFrame = saved_cframe
-					root.AssemblyLinearVelocity = Vector3.zero
-					root.AssemblyAngularVelocity = Vector3.zero
-					humanoid.PlatformStand = false
-					humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+				if character.Parent then
+					pcall(restore_role_reset_character, character, saved_cframe)
 				end
 				if role_reset_connection then role_reset_connection:Disconnect(); role_reset_connection = nil end
 				role_reset_busy = false
@@ -384,6 +401,11 @@ do
 						pcall(firetouchinterest, root, target_head, 0)
 						pcall(firetouchinterest, root, target_head, 1)
 					end
+				end
+				-- This hidden-property assignment is part of the reference used.lua
+				-- fling/reset mechanic; guard it because executors expose it differently.
+				if type(sethiddenproperty) == "function" then
+					pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root)
 				end
 			end
 		end)
@@ -1057,6 +1079,7 @@ do
 		auto_on = false,
 		auto_delay = 0,
 		am_sheriff = false,
+		target_seen = false,
 		fire_gap = 0,
 		last_shot = 0,
 		stand_off = 15,
@@ -1139,6 +1162,7 @@ do
 			target_part = nil
 			target_hum = nil
 		end
+		if found then S.target_seen = true end
 		if not found then return end
 		local char = found.Character
 		if char ~= target_char then
@@ -1159,6 +1183,26 @@ do
 		if not target_part or not target_part.Parent then return false end
 		if not target_hum or not target_hum.Parent then return false end
 		return target_hum.Health > 0
+	end
+
+	-- A temporarily missing Murderer model is not proof that the round has ended.
+	-- Only stop AutoShoot when round data confirms death, or a known Murderer
+	-- character has a zero-health Humanoid. This avoids the start/stop race at launch.
+	local function murderer_confirmed_dead()
+		local m = get_round()
+		local data = m and m.PlayerData
+		if type(data) ~= "table" then return false end
+		for name, info in pairs(data) do
+			if type(info) == "table" and info.Role == "Murderer" then
+				if info.Dead == true or info.Killed == true then return true end
+				local murderer = players:FindFirstChild(name)
+				local char = murderer and murderer.Character
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				if hum and hum.Health <= 0 then return true end
+				return false
+			end
+		end
+		return false
 	end
 
 	local ray_params = RaycastParams.new()
@@ -2452,7 +2496,7 @@ do
 			connect_gun_fired()
 		end
 		auto_step(now)
-		if S.auto_on and (not target_alive()) then
+		if S.auto_on and S.target_seen and murderer_confirmed_dead() then
 			S.auto_on = false
 			S.enabled = false
 			S.force = false
@@ -2467,6 +2511,7 @@ do
 
 
 	getgenv().AUTOSHOOT_START = function()
+		S.target_seen = false
 		S.enabled = true
 		S.auto_on = true
 		S.force = true
@@ -2981,7 +3026,44 @@ do
     local server_hop_player_limit = math.clamp(tonumber(farm_config.server_hop_player_limit) or 3, 1, 10)
     local server_hop_busy = false
     local server_hop_last_coin = os.clock()
+    local server_hop_retry_after = 0
+    local SERVER_HOP_RETRY_DELAY = 20
     local SERVER_STUCK_TIMEOUT = 6 * 60
+
+    -- Keep a short history across teleports so the player-count rule cannot bounce
+    -- between the same low-population public servers forever.
+    local server_hop_env = getgenv()
+    local server_hop_visited = server_hop_env.__AUTOFARM_VISITED_SERVERS
+    if type(server_hop_visited) ~= "table" then
+        server_hop_visited = {}
+        server_hop_env.__AUTOFARM_VISITED_SERVERS = server_hop_visited
+    end
+    if type(game.JobId) == "string" and game.JobId ~= "" then
+        server_hop_visited[game.JobId] = os.time()
+    end
+
+    local function server_hop_prune_visited()
+        local cutoff = os.time() - 30 * 60
+        local count = 0
+        for id, stamp in pairs(server_hop_visited) do
+            if type(stamp) ~= "number" or stamp < cutoff then
+                server_hop_visited[id] = nil
+            else
+                count += 1
+            end
+        end
+        -- Bound state size in long sessions; older entries are dropped first.
+        if count > 120 then
+            local entries = {}
+            for id, stamp in pairs(server_hop_visited) do
+                entries[#entries + 1] = {id = id, stamp = stamp}
+            end
+            table.sort(entries, function(a, b) return a.stamp < b.stamp end)
+            for i = 1, count - 100 do
+                server_hop_visited[entries[i].id] = nil
+            end
+        end
+    end
 
     local function server_hop_request(url)
         local request_fn = rawget(getgenv(), "request")
@@ -3007,16 +3089,24 @@ do
         return nil
     end
 
-    local function server_hop_find_target(require_more_players)
-        -- The configured player limit is the trigger for leaving the CURRENT server,
-        -- not a minimum population requirement for the destination. The old code
-        -- required the destination to have more players than the limit, which often
-        -- returned no result and printed "no public server found".
+    local function server_hop_find_target(reason)
+        server_hop_prune_visited()
+
+        -- For player-count hops, require a destination strictly above BOTH the
+        -- configured threshold and the population of this server. This guarantees
+        -- progress instead of bouncing between servers at/below the same limit.
+        local current_players = #Players:GetPlayers()
+        local min_population = 0
+        if reason == "players" then
+            min_population = math.max(server_hop_player_limit, current_players)
+        end
+
         local candidates = {}
         local seen = {}
         local cursor = ""
+        local pages_checked = 0
 
-        for _ = 1, 5 do
+        for _ = 1, 8 do
             local url = string.format(
                 "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true%s",
                 game.PlaceId,
@@ -3026,15 +3116,22 @@ do
             if not body then break end
             local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
             if not ok or type(data) ~= "table" or type(data.data) ~= "table" then break end
+            pages_checked += 1
 
             for _, server in ipairs(data.data) do
                 if type(server) == "table" and type(server.id) == "string"
-                    and server.id ~= "" and server.id ~= game.JobId and not seen[server.id] then
+                    and server.id ~= "" and server.id ~= game.JobId and not seen[server.id]
+                    and not server_hop_visited[server.id] then
                     local playing = tonumber(server.playing)
                     local max_players = tonumber(server.maxPlayers)
-                    if playing and max_players and max_players > 0 and playing < max_players then
+                    if playing and max_players and max_players > 0 and playing < max_players
+                        and playing > min_population then
                         seen[server.id] = true
-                        candidates[#candidates + 1] = server.id
+                        candidates[#candidates + 1] = {
+                            id = server.id,
+                            playing = playing,
+                            free = max_players - playing,
+                        }
                     end
                 end
             end
@@ -3043,8 +3140,27 @@ do
             if cursor == "" then break end
         end
 
-        if #candidates == 0 then return nil end
-        return candidates[math.random(1, #candidates)]
+        if #candidates == 0 then
+            if reason == "players" then
+                warn(string.format(
+                    "[server hop] no unvisited public server found with more than %d players after checking %d page(s); retrying in %d seconds",
+                    min_population, pages_checked, SERVER_HOP_RETRY_DELAY
+                ))
+            else
+                warn("[server hop] no unvisited public server candidates found")
+            end
+            return nil
+        end
+
+        -- Prefer well-populated servers, but choose among the best few to avoid
+        -- always selecting a single full-ish server from the first API page.
+        table.sort(candidates, function(a, b)
+            if a.playing == b.playing then return a.free > b.free end
+            return a.playing > b.playing
+        end)
+        local pool_size = math.min(#candidates, 10)
+        local chosen = candidates[math.random(1, pool_size)]
+        return chosen.id
     end
 
     -- Public raw GitHub source used by queue_on_teleport after server changes.
@@ -3091,6 +3207,7 @@ do
             server_hop_stuck = server_hop_stuck,
             server_hop_players = server_hop_players,
             server_hop_player_limit = server_hop_player_limit,
+            server_hop_visited = server_hop_visited,
         }
 
         local loader = string.format([[
@@ -3137,38 +3254,49 @@ do
                 if type(data.server_hop_player_limit) == "number" then
                     server_hop_player_limit = math.clamp(data.server_hop_player_limit, 1, 10)
                 end
+                if type(data.server_hop_visited) == "table" then
+                    for id, stamp in pairs(data.server_hop_visited) do
+                        if type(id) == "string" and type(stamp) == "number" then
+                            server_hop_visited[id] = stamp
+                        end
+                    end
+                    server_hop_prune_visited()
+                end
             end
             getgenv().__QUEUE_DATA = nil
         end
     end
 
     local function perform_server_hop(reason)
-        if server_hop_busy then return false end
+        if server_hop_busy or os.clock() < server_hop_retry_after then return false end
         server_hop_busy = true
 
-        -- Queue the script before every teleport so the new server automatically
-        -- restores the AutoFarm UI and all persisted settings.
-        queue_server_hop_script()
-
-        -- The player-count limit triggers leaving this server; destinations can have any non-full population.
-        local target = server_hop_find_target(reason == "players")
-        if target then
-            local ok = pcall(function()
-                TeleportService:TeleportToPlaceInstance(game.PlaceId, target, lp)
-            end)
-            if ok then return true end
-        else
-            warn("[server hop] public-server lookup failed or returned no candidates; trying Roblox matchmaking")
+        local target = server_hop_find_target(reason)
+        if not target then
+            -- Do not use Teleport() matchmaking as a fallback for player-count
+            -- hops: it can put us right back in a low-pop server and create a loop.
+            server_hop_busy = false
+            server_hop_retry_after = os.clock() + SERVER_HOP_RETRY_DELAY
+            return false
         end
 
-        -- If the public-server API is unavailable/rate-limited, let Roblox matchmaking
-        -- choose a destination instead of leaving Server Hop permanently stuck.
-        local ok = pcall(function()
-            TeleportService:Teleport(game.PlaceId, lp)
-        end)
-        if ok then return true end
+        -- Record the destination before initiating teleport so a quick failure or
+        -- re-execution does not immediately choose the same instance again.
+        server_hop_visited[target] = os.time()
+        server_hop_prune_visited()
+        queue_server_hop_script()
 
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, target, lp)
+        end)
+        if ok then
+            return true
+        end
+
+        warn("[server hop] TeleportToPlaceInstance failed: " .. tostring(err))
+        server_hop_visited[target] = os.time()
         server_hop_busy = false
+        server_hop_retry_after = os.clock() + SERVER_HOP_RETRY_DELAY
         return false
     end
 
@@ -3202,6 +3330,7 @@ do
 
     local teleport_failed_conn = TeleportService.TeleportInitFailed:Connect(function()
         server_hop_busy = false
+        server_hop_retry_after = os.clock() + SERVER_HOP_RETRY_DELAY
     end)
 
     local SettingsSection = SettingsTab:Section({
@@ -3269,7 +3398,7 @@ do
     })
 
     local settings_monitor_conn = RunService.Heartbeat:Connect(function()
-        if server_hop_busy then return end
+        if server_hop_busy or os.clock() < server_hop_retry_after then return end
 
         if server_hop_players and #Players:GetPlayers() <= server_hop_player_limit then
             perform_server_hop("players")
