@@ -287,6 +287,9 @@ do
 	for name, pos in pairs(farm_stage_positions) do
 		farm_stage_normalized[string.lower((name:gsub("[^%w]", "")))] = { name = name, position = pos }
 	end
+	-- Some map builds use compact names or keep the display name on a child model.
+	farm_stage_normalized.hotel2 = farm_stage_normalized.hotel2 or { name = "Hotel 2", position = farm_stage_positions["Hotel 2"] }
+	farm_stage_normalized.hotel = farm_stage_normalized.hotel or { name = "Hotel 2", position = farm_stage_positions["Hotel 2"] }
 	local farm_stage_name = nil
 	local farm_stage_position = nil
 	local farm_stage_scan_at = 0
@@ -483,11 +486,20 @@ do
 		farm_stage_scan_at = now + 0.35
 
 		local found = nil
-		for _, obj in ipairs(workspace:GetDescendants()) do
+		local candidates = {}
+		local map_container = workspace:FindFirstChild("Map") or workspace:FindFirstChild("Maps")
+		if map_container then candidates[#candidates + 1] = map_container end
+		for _, obj in ipairs(workspace:GetChildren()) do candidates[#candidates + 1] = obj end
+		for _, obj in ipairs(candidates) do
 			local key = farm_stage_normalized[normalize_map_name(obj.Name)]
-			if key then
-				found = key
-				break
+			if key then found = key; break end
+		end
+		if not found then
+			for _, obj in ipairs(workspace:GetDescendants()) do
+				local normalized = normalize_map_name(obj.Name)
+				local key = farm_stage_normalized[normalized]
+				if key and (normalized == "hotel2" or normalized == "hotel") then found = key; break end
+				if key and (obj:IsA("Model") or obj:IsA("Folder")) then found = key; break end
 			end
 		end
 
@@ -507,9 +519,17 @@ do
 		return farm_stage_name, farm_stage_position
 	end
 
+	local farm_stage_last_tp = 0
 	local function farm_stage_to_map(position)
 		local hrp = farm_hrp()
 		if not hrp or not position then return false end
+		-- Reapply only when displaced or after a short interval; writing CFrame every
+		-- Stepped frame caused a teleport/physics loop and severe client lag.
+		local now = os.clock()
+		if (hrp.Position - position).Magnitude < 2 or now - farm_stage_last_tp < 0.35 then
+			return true
+		end
+		farm_stage_last_tp = now
 		set_farm_noclip(true)
 		pcall(function()
 			hrp.CFrame = CFrame.new(position)
@@ -737,38 +757,9 @@ do
 		-- Keep reapplying the map-specific airborne position until CoinVisuals exist.
 		local stage_name, stage_pos = find_active_farm_map()
 		if not stage_name and not farm_stage_ready and #available_coins() == 0 then
-			-- Unknown-map fallback: teleport to the safe point first, then directly teleport to a map spawn.
+			-- Unknown map or round-loading phase: stay at the safe holding point.
+			-- Never bounce to a spawn; that caused the one-second teleport and lag loop.
 			farm_stage_to_map(farm_unknown_stage_position)
-			if farm_unknown_teleport_pending then return end
-			farm_unknown_teleport_pending = true
-			task.spawn(function()
-				task.wait(0.12)
-				if not autofarm_on then farm_unknown_teleport_pending = false return end
-				local char2 = lp.Character
-				local root2 = char2 and char2:FindFirstChild("HumanoidRootPart")
-				if not root2 then farm_unknown_teleport_pending = false return end
-				local lobby = workspace:FindFirstChild("RegularLobby") or workspace:FindFirstChild("Lobby")
-				local spawnPart
-				for _, obj in ipairs(workspace:GetDescendants()) do
-					if obj:IsA("SpawnLocation") or (obj:IsA("BasePart") and obj.Name == "Spawn") then
-						local inLobby = lobby and obj:IsDescendantOf(lobby)
-						if not inLobby then
-							spawnPart = obj
-							break
-						end
-					end
-				end
-				if spawnPart and spawnPart.Parent then
-					pcall(function()
-						root2.CFrame = spawnPart.CFrame + Vector3.new(0, 4, 0)
-						root2.AssemblyLinearVelocity = Vector3.zero
-						root2.AssemblyAngularVelocity = Vector3.zero
-					end)
-					farm_stage_ready = true
-					set_farm_noclip(false)
-				end
-				farm_unknown_teleport_pending = false
-			end)
 			return
 		end
 		if stage_pos and not farm_stage_ready then
@@ -776,6 +767,7 @@ do
 				stage_before_coins()
 				return
 			end
+			-- Coins are present: the round/map is live, so release the staging hold once.
 			farm_stage_ready = true
 			set_farm_noclip(false)
 			hrp = farm_hrp()
@@ -2540,19 +2532,19 @@ do
     end
 
     local function ensure_knife_equipped()
+        -- Match the source AutoKill/Kill All logic: only send knife events for
+        -- the equipped tool. If it is still in the Backpack, equip and retry
+        -- on the next worker iteration.
         local char = lp.Character
-        if char then
-            local k = char:FindFirstChild("Knife")
-            if k then return k end
-        end
+        local equipped = char and char:FindFirstChild("Knife")
+        if equipped then return equipped end
         local bp = lp:FindFirstChildOfClass("Backpack")
-        local k = bp and bp:FindFirstChild("Knife")
-        if k then
+        local stored = bp and bp:FindFirstChild("Knife")
+        if stored then
             local hum = char and char:FindFirstChildOfClass("Humanoid")
-            if hum then pcall(function() hum:EquipTool(k) end) end
-            task.wait()
-            return lp.Character and lp.Character:FindFirstChild("Knife") or k
+            if hum then pcall(function() hum:EquipTool(stored) end) end
         end
+        return nil
     end
 
     local function knife_stab(knife)
@@ -2567,17 +2559,22 @@ do
         if touched then pcall(function() touched:FireServer(part) end) end
     end
 
+    local kill_all_last_kill = 0
     local function kill_all()
+        -- Source behavior: while alive as Murderer, stab once then touch every
+        -- living player's root/head. The caller retries continuously after the
+        -- bag fills, including after local respawns.
         local role, me = local_role()
         if not (role == "Murderer" and me and not me.Dead) then return end
-        if getgenv().AUTOFARM_HOLD then return end
+        if os.clock() - kill_all_last_kill < 0.05 then return end
         local knife = ensure_knife_equipped()
         if not knife then return end
         local victims = {}
         for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp and plr.Character then
-                local hum = plr.Character:FindFirstChildOfClass("Humanoid")
-                local part = plr.Character:FindFirstChild("HumanoidRootPart") or plr.Character:FindFirstChild("Head")
+            if plr ~= lp then
+                local char = plr.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local part = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head"))
                 if hum and hum.Health > 0 and part then
                     victims[#victims + 1] = part
                 end
@@ -2586,6 +2583,7 @@ do
         if #victims > 0 then
             knife_stab(knife)
             for _, part in ipairs(victims) do knife_touch(knife, part) end
+            kill_all_last_kill = os.clock()
         end
     end
 
@@ -2802,36 +2800,84 @@ do
         end)
     end
 
-    local function post_bag_actions()
-        -- Hard safety gate: no fling/kill/shoot actions unless the visible coin bag is full.
-        if not coin_bags_full() then
-            getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
-            role_fling_role = nil
-            return
+    local BAG_ACTION_POSITION = Vector3.new(134.79, 150.45, 8977.42)
+    local bag_action_thread = nil
+    local bag_action_generation = 0
+
+    local function murderer_is_alive()
+        local m = get_round()
+        local data = m and m.PlayerData
+        if type(data) == "table" then
+            for name, info in pairs(data) do
+                if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
+                    if info.Dead == true or info.Killed == true then return false end
+                    local target = Players:FindFirstChild(name)
+                    local hum = target and target.Character and target.Character:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.Health <= 0 then return false end
+                    return true
+                end
+            end
+            return false
         end
+        return true -- keep trying while role data is temporarily unavailable
+    end
+
+    local function any_living_victim()
+        for _, target in ipairs(Players:GetPlayers()) do
+            if target ~= lp then
+                local char = target.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 then return true end
+            end
+        end
+        return false
+    end
+
+    local function post_bag_actions()
+        -- Do not start post-bag actions unless the actual visible bag UI confirms full.
+        if not coin_bags_full() then return end
         getgenv().AUTOFARM_BAG_FLING_ACTIVE = true
         local bag_role = local_role()
-        if bag_role == "Sheriff" and fling_murder_sheriff_on then
-            role_fling_role = "Sheriff"
+        if (bag_role == "Sheriff" and fling_murder_sheriff_on)
+            or (bag_role == "Innocent" and fling_murder_innocent_on) then
+            role_fling_role = bag_role
             role_fling_step()
-        elseif bag_role == "Innocent" and fling_murder_innocent_on then
-            role_fling_role = "Innocent"
-            role_fling_step()
-        else
-            role_fling_role = nil
         end
-        if kill_all_on then pcall(kill_all) end
-        if autoshoot_on then
-            local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                pcall(function()
-                    hrp.CFrame = CFrame.new(134.79, 150.45, 8977.42)
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                    hrp.AssemblyAngularVelocity = Vector3.zero
-                end)
+        if bag_action_thread then return end
+        bag_action_generation += 1
+        local my_generation = bag_action_generation
+        bag_action_thread = task.spawn(function()
+            local shoot_started = false
+            while my_generation == bag_action_generation and coin_bags_full() do
+                local char = lp.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if root and hum and hum.Health > 0 then
+                    if autoshoot_on or kill_all_on then
+                        pcall(function()
+                            root.CFrame = CFrame.new(BAG_ACTION_POSITION)
+                            root.AssemblyLinearVelocity = Vector3.zero
+                            root.AssemblyAngularVelocity = Vector3.zero
+                        end)
+                    end
+                    if autoshoot_on then
+                        local state = getgenv().SILENT_S
+                        if not shoot_started or (type(state) == "table" and not state.auto_on and murderer_is_alive()) then
+                            pcall(function() getgenv().AUTOSHOOT_START() end)
+                            shoot_started = true
+                        end
+                    end
+                    if kill_all_on then pcall(kill_all) end
+                end
+                -- AutoShoot ends when the Murderer is confirmed dead. AutoKill
+                -- keeps retrying the source knife-touch logic while the bag stays
+                -- full, so temporary missing characters/respawns do not stop it.
+                if autoshoot_on and not kill_all_on and not murderer_is_alive() then break end
+                task.wait(0.15)
             end
-            pcall(function() getgenv().AUTOSHOOT_START() end)
-        end
+            if shoot_started then pcall(function() getgenv().AUTOSHOOT_STOP() end) end
+            if my_generation == bag_action_generation then bag_action_thread = nil end
+        end)
     end
     getgenv().AUTOFARM_BAG_CALLBACK = post_bag_actions
 
@@ -2866,8 +2912,8 @@ do
     })
 
     ExtraSection:Toggle({
-        Title = "Kill All",
-        Desc = "After a full coin bag, kills all living players if you are the Murderer.",
+        Title = "AutoKill (Murderer)",
+        Desc = "After a full coin bag, teleports to the action position and repeatedly attacks every living player using the source knife logic.",
         Flag = "Kill All After Bag",
         Value = farm_config.kill_all,
         Callback = function(v) kill_all_on = v; farm_config_set("kill_all", v) end,
@@ -3274,6 +3320,8 @@ do
         pcall(function() getgenv().AUTOSHOOT_STOP() end)
         kill_all_on=false
         autoshoot_on=false
+        bag_action_generation += 1
+        bag_action_thread = nil
         fling_murder_sheriff_on=false
         fling_murder_innocent_on=false
         role_fling_role=nil
