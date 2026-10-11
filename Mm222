@@ -262,6 +262,11 @@ do
 	local round_mod = nil
 	local collected_ids = {}
 	local collected_count = 0
+	local total_coins_collected = 0
+	local total_counted_coin_instances = setmetatable({}, { __mode = "k" })
+	local farm_runtime_accumulated = 0
+	local farm_runtime_started_at = nil
+	local stats_loop_running = true
 
 	local farm_mode = (farm_config.farm_type == "Down") and "Down" or "Basic"
 	local farm_speed = tonumber(farm_config.farm_speed) or 23
@@ -287,12 +292,16 @@ do
 	for name, pos in pairs(farm_stage_positions) do
 		farm_stage_normalized[string.lower((name:gsub("[^%w]", "")))] = { name = name, position = pos }
 	end
+	-- The live map is named "Hotel" in some game builds and "Hotel 2" in others.
+	farm_stage_normalized["hotel"] = { name = "Hotel 2", position = farm_stage_positions["Hotel 2"] }
+	farm_stage_normalized["hotel2"] = { name = "Hotel 2", position = farm_stage_positions["Hotel 2"] }
 	local farm_stage_name = nil
 	local farm_stage_position = nil
 	local farm_stage_scan_at = 0
 	local farm_stage_ready = false
+	local farm_stage_last_teleport = 0
+	local farm_stage_last_teleport_position = nil
 	local farm_unknown_stage_position = Vector3.new(14.35, 504.82, -3.25)
-	local farm_unknown_teleport_pending = false
 	local down_ref_y = nil
 	local last_touch = 0
 	local DOWN_DEPTH = 14
@@ -462,7 +471,8 @@ do
 		farm_stage_name = nil
 		farm_stage_position = nil
 		farm_stage_scan_at = 0
-		farm_unknown_teleport_pending = false
+		farm_stage_last_teleport = 0
+		farm_stage_last_teleport_position = nil
 		if not preserve_bag_fling then
 			getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
 		end
@@ -495,17 +505,40 @@ do
 
 	local function find_active_farm_map()
 		local now = os.clock()
-		if now < farm_stage_scan_at and farm_stage_name and farm_stage_position then
+		if now < farm_stage_scan_at then
 			return farm_stage_name, farm_stage_position
 		end
-		farm_stage_scan_at = now + 0.35
+		-- Scanning all of Workspace every few frames caused unnecessary CPU spikes.
+		-- Prefer the active Map container and only use a throttled fallback scan.
+		farm_stage_scan_at = now + 1.25
 
 		local found = nil
-		for _, obj in ipairs(workspace:GetDescendants()) do
+		local function check_name(obj)
+			if not obj then return nil end
 			local key = farm_stage_normalized[normalize_map_name(obj.Name)]
-			if key then
-				found = key
-				break
+			return key
+		end
+		local map_root = workspace:FindFirstChild("Map") or workspace:FindFirstChild("map")
+		if map_root then
+			found = check_name(map_root)
+			if not found then
+				for _, obj in ipairs(map_root:GetDescendants()) do
+					found = check_name(obj)
+					if found then break end
+				end
+			end
+		end
+		if not found then
+			-- Check top-level models first; only do a full fallback if the game uses a different hierarchy.
+			for _, obj in ipairs(workspace:GetChildren()) do
+				found = check_name(obj)
+				if found then break end
+			end
+		end
+		if not found and not map_root then
+			for _, obj in ipairs(workspace:GetDescendants()) do
+				found = check_name(obj)
+				if found then break end
 			end
 		end
 
@@ -521,6 +554,8 @@ do
 			farm_stage_ready = false
 			farm_target = nil
 			saw_coins = false
+			farm_stage_last_teleport = 0
+			farm_stage_last_teleport_position = nil
 		end
 		return farm_stage_name, farm_stage_position
 	end
@@ -528,15 +563,28 @@ do
 	local function farm_stage_to_map(position)
 		local hrp = farm_hrp()
 		if not hrp or not position then return false end
+		local now = os.clock()
+		local same_position = farm_stage_last_teleport_position
+			and (farm_stage_last_teleport_position - position).Magnitude < 1
+		if same_position and (hrp.Position - position).Magnitude <= 8 then
+			return true
+		end
+		-- If the game overwrites our CFrame during round start, correct it at most once per 0.9s.
+		if same_position and now - farm_stage_last_teleport < 0.9 then
+			return false
+		end
 		set_farm_noclip(true)
-		pcall(function()
+		local ok = pcall(function()
 			hrp.CFrame = CFrame.new(position)
 			hrp.AssemblyLinearVelocity = Vector3.zero
 			hrp.AssemblyAngularVelocity = Vector3.zero
 		end)
-		return true
+		if ok then
+			farm_stage_last_teleport = now
+			farm_stage_last_teleport_position = position
+		end
+		return ok
 	end
-
 
 	local function available_coins()
 		local list = {}
@@ -755,38 +803,10 @@ do
 		-- Keep reapplying the map-specific airborne position until CoinVisuals exist.
 		local stage_name, stage_pos = find_active_farm_map()
 		if not stage_name and not farm_stage_ready and #available_coins() == 0 then
-			-- Unknown-map fallback: teleport to the safe point first, then directly teleport to a map spawn.
+			-- Unknown-map anti-targeting: remain at the high safe point and wait for coins.
+			-- Do not guess a SpawnLocation; that used to teleport the player to a random point
+			-- and repeatedly fight the game's round-start spawn correction.
 			farm_stage_to_map(farm_unknown_stage_position)
-			if farm_unknown_teleport_pending then return end
-			farm_unknown_teleport_pending = true
-			task.spawn(function()
-				task.wait(0.12)
-				if not autofarm_on then farm_unknown_teleport_pending = false return end
-				local char2 = lp.Character
-				local root2 = char2 and char2:FindFirstChild("HumanoidRootPart")
-				if not root2 then farm_unknown_teleport_pending = false return end
-				local lobby = workspace:FindFirstChild("RegularLobby") or workspace:FindFirstChild("Lobby")
-				local spawnPart
-				for _, obj in ipairs(workspace:GetDescendants()) do
-					if obj:IsA("SpawnLocation") or (obj:IsA("BasePart") and obj.Name == "Spawn") then
-						local inLobby = lobby and obj:IsDescendantOf(lobby)
-						if not inLobby then
-							spawnPart = obj
-							break
-						end
-					end
-				end
-				if spawnPart and spawnPart.Parent then
-					pcall(function()
-						root2.CFrame = spawnPart.CFrame + Vector3.new(0, 4, 0)
-						root2.AssemblyLinearVelocity = Vector3.zero
-						root2.AssemblyAngularVelocity = Vector3.zero
-					end)
-					farm_stage_ready = true
-					set_farm_noclip(false)
-				end
-				farm_unknown_teleport_pending = false
-			end)
 			return
 		end
 		if stage_pos and not farm_stage_ready then
@@ -808,6 +828,10 @@ do
 					if id and not collected_ids[id] then
 						collected_ids[id] = true
 						collected_count = collected_count + 1
+						if not total_counted_coin_instances[v] then
+							total_counted_coin_instances[v] = true
+							 total_coins_collected = total_coins_collected + 1
+						end
 					end
 				elseif not v:GetAttribute("Delete") then
 					list[#list + 1] = v
@@ -929,6 +953,12 @@ do
         Flag = "Auto Farm",
         Value = farm_config.auto_farm,
         Callback = function(v)
+            if v and not autofarm_on then
+                farm_runtime_started_at = os.clock()
+            elseif not v and autofarm_on and farm_runtime_started_at then
+                farm_runtime_accumulated = farm_runtime_accumulated + math.max(0, os.clock() - farm_runtime_started_at)
+                farm_runtime_started_at = nil
+            end
             autofarm_on = v
             farm_config_set("auto_farm", v)
             reset_farm_progress()
@@ -1021,7 +1051,43 @@ do
         Callback = function(v) autoreset_innocent_on = v; farm_config_set("auto_reset_innocent", v) end
     })
 
+    -- Live farming statistics: total collected coins and cumulative time with Farm enabled.
+    local StatsSection = AutoFarmTab:Section({Title = "Stats", Box = true, Opened = true})
+    local function get_farm_runtime()
+        local elapsed = farm_runtime_accumulated
+        if farm_runtime_started_at then
+            elapsed = elapsed + math.max(0, os.clock() - farm_runtime_started_at)
+        end
+        return elapsed
+    end
+    local function format_runtime(seconds)
+        seconds = math.max(0, math.floor(seconds))
+        local hours = math.floor(seconds / 3600)
+        local minutes = math.floor((seconds % 3600) / 60)
+        local secs = seconds % 60
+        return string.format("%02d:%02d:%02d", hours, minutes, secs)
+    end
+    local function stats_description()
+        local runtime = get_farm_runtime()
+        local coins_per_hour = runtime > 0 and (total_coins_collected * 3600 / runtime) or 0
+        return string.format("Coins collected: %d\nCoins per hour: %.1f\nFarm runtime: %s",
+            total_coins_collected, coins_per_hour, format_runtime(runtime))
+    end
+    local StatsParagraph = StatsSection:Paragraph({
+        Title = "Farm Statistics",
+        Desc = stats_description(),
+    })
+    task.spawn(function()
+        while stats_loop_running do
+            task.wait(1)
+            if StatsParagraph then
+                pcall(function() StatsParagraph:SetDesc(stats_description()) end)
+            end
+        end
+    end)
+
     getgenv().AUTOFARM_UNLOAD = function()
+        stats_loop_running = false
         autofarm_on = false
         autoreset_sheriff_on = false
         autoreset_murderer_on = false
@@ -1058,6 +1124,9 @@ do
     farm_mode = (farm_config.farm_type == "Down") and "Down" or "Basic"
     autograb_on = farm_config.grab_gun
     autofarm_on = farm_config.auto_farm
+    if autofarm_on and not farm_runtime_started_at then
+        farm_runtime_started_at = os.clock()
+    end
     avoid_murder = farm_config.murder_check
     autoreset_sheriff_on = farm_config.auto_reset_sheriff
     autoreset_murderer_on = farm_config.auto_reset_murderer
