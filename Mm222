@@ -287,9 +287,6 @@ do
 	for name, pos in pairs(farm_stage_positions) do
 		farm_stage_normalized[string.lower((name:gsub("[^%w]", "")))] = { name = name, position = pos }
 	end
-	-- Some map builds use compact names or keep the display name on a child model.
-	farm_stage_normalized.hotel2 = farm_stage_normalized.hotel2 or { name = "Hotel 2", position = farm_stage_positions["Hotel 2"] }
-	farm_stage_normalized.hotel = farm_stage_normalized.hotel or { name = "Hotel 2", position = farm_stage_positions["Hotel 2"] }
 	local farm_stage_name = nil
 	local farm_stage_position = nil
 	local farm_stage_scan_at = 0
@@ -329,9 +326,8 @@ do
 	local role_reset_busy = false
 	local role_reset_connection = nil
 
-	-- Restore the local character the same way the supplied used.lua reset routine does.
 	local function restore_role_reset_character(character, saved_cframe)
-		if not character or not saved_cframe then return end
+		if not character then return end
 		local humanoid = character:FindFirstChildOfClass("Humanoid")
 		local root = character:FindFirstChild("HumanoidRootPart")
 		if not humanoid or not root then return end
@@ -341,9 +337,8 @@ do
 		end
 		root.AssemblyLinearVelocity = Vector3.zero
 		root.AssemblyAngularVelocity = Vector3.zero
-		root.Velocity = Vector3.zero
-		root.RotVelocity = Vector3.zero
-		root.CFrame = saved_cframe
+		pcall(function() root.Velocity = Vector3.zero; root.RotVelocity = Vector3.zero end)
+		if saved_cframe then root.CFrame = saved_cframe end
 		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 		for _, part in ipairs(character:GetDescendants()) do
 			if part:IsA("BasePart") then part.CanCollide = true end
@@ -402,11 +397,9 @@ do
 						pcall(firetouchinterest, root, target_head, 1)
 					end
 				end
-				-- This hidden-property assignment is part of the reference used.lua
-				-- fling/reset mechanic; guard it because executors expose it differently.
-				if type(sethiddenproperty) == "function" then
-					pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root)
-				end
+			end
+			if type(sethiddenproperty) == "function" then
+				pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root)
 			end
 		end)
 		return true
@@ -508,20 +501,11 @@ do
 		farm_stage_scan_at = now + 0.35
 
 		local found = nil
-		local candidates = {}
-		local map_container = workspace:FindFirstChild("Map") or workspace:FindFirstChild("Maps")
-		if map_container then candidates[#candidates + 1] = map_container end
-		for _, obj in ipairs(workspace:GetChildren()) do candidates[#candidates + 1] = obj end
-		for _, obj in ipairs(candidates) do
+		for _, obj in ipairs(workspace:GetDescendants()) do
 			local key = farm_stage_normalized[normalize_map_name(obj.Name)]
-			if key then found = key; break end
-		end
-		if not found then
-			for _, obj in ipairs(workspace:GetDescendants()) do
-				local normalized = normalize_map_name(obj.Name)
-				local key = farm_stage_normalized[normalized]
-				if key and (normalized == "hotel2" or normalized == "hotel") then found = key; break end
-				if key and (obj:IsA("Model") or obj:IsA("Folder")) then found = key; break end
+			if key then
+				found = key
+				break
 			end
 		end
 
@@ -541,18 +525,9 @@ do
 		return farm_stage_name, farm_stage_position
 	end
 
-	local farm_stage_last_tp = 0
 	local function farm_stage_to_map(position)
 		local hrp = farm_hrp()
 		if not hrp or not position then return false end
-		-- Teleport to the map staging point only when actually displaced. The unknown-map
-		-- fallback is intentionally retained, but repeatedly snapping back to it every
-		-- 0.35s caused physics churn and lag. Allow small drift while waiting for the round.
-		local now = os.clock()
-		if (hrp.Position - position).Magnitude < 12 or (farm_stage_last_tp > 0 and now - farm_stage_last_tp < 1.0) then
-			return true
-		end
-		farm_stage_last_tp = now
 		set_farm_noclip(true)
 		pcall(function()
 			hrp.CFrame = CFrame.new(position)
@@ -780,9 +755,38 @@ do
 		-- Keep reapplying the map-specific airborne position until CoinVisuals exist.
 		local stage_name, stage_pos = find_active_farm_map()
 		if not stage_name and not farm_stage_ready and #available_coins() == 0 then
-			-- Unknown map or round-loading phase: stay at the safe holding point.
-			-- Never bounce to a spawn; that caused the one-second teleport and lag loop.
+			-- Unknown-map fallback: teleport to the safe point first, then directly teleport to a map spawn.
 			farm_stage_to_map(farm_unknown_stage_position)
+			if farm_unknown_teleport_pending then return end
+			farm_unknown_teleport_pending = true
+			task.spawn(function()
+				task.wait(0.12)
+				if not autofarm_on then farm_unknown_teleport_pending = false return end
+				local char2 = lp.Character
+				local root2 = char2 and char2:FindFirstChild("HumanoidRootPart")
+				if not root2 then farm_unknown_teleport_pending = false return end
+				local lobby = workspace:FindFirstChild("RegularLobby") or workspace:FindFirstChild("Lobby")
+				local spawnPart
+				for _, obj in ipairs(workspace:GetDescendants()) do
+					if obj:IsA("SpawnLocation") or (obj:IsA("BasePart") and obj.Name == "Spawn") then
+						local inLobby = lobby and obj:IsDescendantOf(lobby)
+						if not inLobby then
+							spawnPart = obj
+							break
+						end
+					end
+				end
+				if spawnPart and spawnPart.Parent then
+					pcall(function()
+						root2.CFrame = spawnPart.CFrame + Vector3.new(0, 4, 0)
+						root2.AssemblyLinearVelocity = Vector3.zero
+						root2.AssemblyAngularVelocity = Vector3.zero
+					end)
+					farm_stage_ready = true
+					set_farm_noclip(false)
+				end
+				farm_unknown_teleport_pending = false
+			end)
 			return
 		end
 		if stage_pos and not farm_stage_ready then
@@ -790,7 +794,6 @@ do
 				stage_before_coins()
 				return
 			end
-			-- Coins are present: the round/map is live, so release the staging hold once.
 			farm_stage_ready = true
 			set_farm_noclip(false)
 			hrp = farm_hrp()
@@ -1077,9 +1080,9 @@ do
 		predict = false,
 		force = false,
 		auto_on = false,
+		target_seen = false,
 		auto_delay = 0,
 		am_sheriff = false,
-		target_seen = false,
 		fire_gap = 0,
 		last_shot = 0,
 		stand_off = 15,
@@ -1156,13 +1159,13 @@ do
 				end
 			end
 		end
+		if found then S.target_seen = true end
 		if found ~= target_player then
 			target_player = found
 			target_char = nil
 			target_part = nil
 			target_hum = nil
 		end
-		if found then S.target_seen = true end
 		if not found then return end
 		local char = found.Character
 		if char ~= target_char then
@@ -1185,24 +1188,22 @@ do
 		return target_hum.Health > 0
 	end
 
-	-- A temporarily missing Murderer model is not proof that the round has ended.
-	-- Only stop AutoShoot when round data confirms death, or a known Murderer
-	-- character has a zero-health Humanoid. This avoids the start/stop race at launch.
+	-- Do not interpret a temporarily unloaded character/round-data race as a kill.
 	local function murderer_confirmed_dead()
 		local m = get_round()
 		local data = m and m.PlayerData
-		if type(data) ~= "table" then return false end
-		for name, info in pairs(data) do
-			if type(info) == "table" and info.Role == "Murderer" then
-				if info.Dead == true or info.Killed == true then return true end
-				local murderer = players:FindFirstChild(name)
-				local char = murderer and murderer.Character
-				local hum = char and char:FindFirstChildOfClass("Humanoid")
-				if hum and hum.Health <= 0 then return true end
-				return false
+		if type(data) == "table" then
+			for name, info in pairs(data) do
+				if type(info) == "table" and info.Role == "Murderer" then
+					if info.Dead == true or info.Killed == true then return true end
+					local plr = players:FindFirstChild(name)
+					local char = plr and plr.Character
+					local hum = char and char:FindFirstChildOfClass("Humanoid")
+					if hum and hum.Health <= 0 then return true end
+				end
 			end
 		end
-		return false
+		return S.target_seen and target_hum ~= nil and target_hum.Parent ~= nil and target_hum.Health <= 0
 	end
 
 	local ray_params = RaycastParams.new()
@@ -2409,7 +2410,7 @@ do
 	end
 
 	local function auto_step(now)
-		if not S.auto_on or not S.enabled or not S.am_sheriff or getgenv().AUTOFARM_HOLD or not target_alive() then
+		if not S.auto_on or not S.enabled or not S.am_sheriff or not target_alive() then
 			want_since = 0
 			return
 		end
@@ -2505,8 +2506,16 @@ do
 		end
 	end
 
+	local last_tick_error_warn = 0
 	local main_conn = run.Heartbeat:Connect(function()
-		pcall(tick)
+		local ok, err = pcall(tick)
+		if not ok then
+			local now = os.clock()
+			if now - last_tick_error_warn >= 5 then
+				warn("[AutoFarm] AutoShoot runtime error: " .. tostring(err))
+				last_tick_error_warn = now
+			end
+		end
 	end)
 
 
@@ -2578,19 +2587,19 @@ do
     end
 
     local function ensure_knife_equipped()
-        -- Match the source AutoKill/Kill All logic: only send knife events for
-        -- the equipped tool. If it is still in the Backpack, equip and retry
-        -- on the next worker iteration.
         local char = lp.Character
-        local equipped = char and char:FindFirstChild("Knife")
-        if equipped then return equipped end
-        local bp = lp:FindFirstChildOfClass("Backpack")
-        local stored = bp and bp:FindFirstChild("Knife")
-        if stored then
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
-            if hum then pcall(function() hum:EquipTool(stored) end) end
+        if char then
+            local k = char:FindFirstChild("Knife")
+            if k then return k end
         end
-        return nil
+        local bp = lp:FindFirstChildOfClass("Backpack")
+        local k = bp and bp:FindFirstChild("Knife")
+        if k then
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum then pcall(function() hum:EquipTool(k) end) end
+            task.wait()
+            return lp.Character and lp.Character:FindFirstChild("Knife") or k
+        end
     end
 
     local function knife_stab(knife)
@@ -2605,22 +2614,17 @@ do
         if touched then pcall(function() touched:FireServer(part) end) end
     end
 
-    local kill_all_last_kill = 0
     local function kill_all()
-        -- Source behavior: while alive as Murderer, stab once then touch every
-        -- living player's root/head. The caller retries continuously after the
-        -- bag fills, including after local respawns.
         local role, me = local_role()
         if not (role == "Murderer" and me and not me.Dead) then return end
-        if os.clock() - kill_all_last_kill < 0.05 then return end
+        if getgenv().AUTOFARM_HOLD then return end
         local knife = ensure_knife_equipped()
         if not knife then return end
         local victims = {}
         for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp then
-                local char = plr.Character
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                local part = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head"))
+            if plr ~= lp and plr.Character then
+                local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+                local part = plr.Character:FindFirstChild("HumanoidRootPart") or plr.Character:FindFirstChild("Head")
                 if hum and hum.Health > 0 and part then
                     victims[#victims + 1] = part
                 end
@@ -2629,7 +2633,6 @@ do
         if #victims > 0 then
             knife_stab(knife)
             for _, part in ipairs(victims) do knife_touch(knife, part) end
-            kill_all_last_kill = os.clock()
         end
     end
 
@@ -2779,151 +2782,134 @@ do
     local fling_murder_innocent_on = farm_config.fling_murderer_innocent
     local role_fling_role = nil
     local role_fling_thread
+    local role_fling_last_error_at = 0
 
     local function role_fling_step()
         if role_fling_thread then return end
         role_fling_thread = task.spawn(function()
-            -- This loop survives local death/respawn and ends only when the target Murderer dies,
-            -- the corresponding toggle is disabled, or the bag action is explicitly cancelled.
-            while getgenv().AUTOFARM_BAG_FLING_ACTIVE do
-                -- Use the same round-data accessor as the farm logic so role detection
-                -- does not depend on a second cached module reference.
-                if not coin_bags_full() then
-                    task.wait(0.25)
-                    continue
-                end
-                local data = get_round_data()
-                local me = type(data) == "table" and data[lp.Name]
-                local role = me and me.Role
-                local enabled = (role == "Sheriff" and fling_murder_sheriff_on)
-                    or (role == "Innocent" and fling_murder_innocent_on)
-                if not enabled then break end
+            -- Keep cleanup reliable if an unexpected runtime error occurs in this worker.
+            local ok, err = xpcall(function()
+                -- This loop survives local death/respawn and ends only when the target Murderer dies,
+                -- the corresponding toggle is disabled, or the bag action is explicitly cancelled.
+                while getgenv().AUTOFARM_BAG_FLING_ACTIVE do
+                    -- Never run the fling unless the visible bag UI confirms it is full.
+                    if not coin_bags_full() then
+                        task.wait(0.25)
+                        continue
+                    end
 
-                local target, target_info
-                if type(data) == "table" then
-                    for name, info in pairs(data) do
-                        if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
-                            target_info = info
-                            target = Players:FindFirstChild(name)
-                            if target then break end
+                    -- get_round_data() belongs to the separate AutoFarm do-block and is not
+                    -- in scope here. Use this block's own CurrentRoundClient accessor instead.
+                    local round = get_round()
+                    local data = round and round.PlayerData
+                    local me = type(data) == "table" and data[lp.Name]
+                    local role = me and me.Role
+                    -- Round data can briefly disappear during respawn/role refresh; retry
+                    -- instead of terminating the only post-bag fling worker.
+                    if not role then
+                        task.wait(0.25)
+                        continue
+                    end
+                    local enabled = (role == "Sheriff" and fling_murder_sheriff_on)
+                        or (role == "Innocent" and fling_murder_innocent_on)
+                    if not enabled then break end
+
+                    local target, target_info
+                    if type(data) == "table" then
+                        for name, info in pairs(data) do
+                            if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
+                                target_info = info
+                                target = Players:FindFirstChild(name)
+                                if target then break end
+                            end
                         end
                     end
-                end
 
-                -- Do not fling during the lobby/device-selection phase. Require valid role
-                -- data for both players and a live Murderer character before engaging.
-                local valid_local_role = me and (me.Role == "Sheriff" or me.Role == "Innocent")
-                if not valid_local_role or not target or not target_info
-                    or target_info.Role ~= "Murderer" then
-                    task.wait(0.25)
-                    continue
-                end
+                    -- Do not fling during the lobby/device-selection phase. Require valid role
+                    -- data for both players and a live Murderer character before engaging.
+                    local valid_local_role = me and (me.Role == "Sheriff" or me.Role == "Innocent")
+                    if not valid_local_role or not target or not target_info
+                        or target_info.Role ~= "Murderer" then
+                        task.wait(0.25)
+                        continue
+                    end
 
-                if target_info.Dead == true or target_info.Killed == true then
-                    break
-                end
+                    if target_info.Dead == true or target_info.Killed == true then
+                        break
+                    end
 
-                local targetChar = target.Character
-                local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
-                local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
-                if not targetHum or targetHum.Health <= 0 or not targetRoot then
-                    task.wait(0.25)
-                    continue
-                end
+                    local targetChar = target.Character
+                    local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
+                    local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+                    if not targetHum or targetHum.Health <= 0 or not targetRoot then
+                        task.wait(0.25)
+                        continue
+                    end
 
-                -- reset_player_target() simply returns false while our character is dead.
-                -- The outer loop remains alive and retries automatically after respawn.
-                if type(getgenv().AUTOFARM_ROLE_FLING) == "function" then
-                    -- Let the fling routine itself report busy/invalid state; don't
-                    -- permanently suppress attempts because another role action was busy.
-                    local ok, result = pcall(getgenv().AUTOFARM_ROLE_FLING, target)
-                    if not ok then warn("[AutoFarm] role fling error: " .. tostring(result)) end
+                    -- Retry after local death/respawn or a temporary busy state.
+                    if type(getgenv().AUTOFARM_ROLE_FLING) == "function" then
+                        local call_ok, result = pcall(getgenv().AUTOFARM_ROLE_FLING, target)
+                        if not call_ok then
+                            local now = os.clock()
+                            if now - role_fling_last_error_at >= 5 then
+                                warn("[AutoFarm] role fling error: " .. tostring(result))
+                                role_fling_last_error_at = now
+                            end
+                        end
+                    end
+                    task.wait(0.05)
                 end
-                task.wait(0.05)
+            end, debug.traceback)
+
+            if not ok then
+                local now = os.clock()
+                if now - role_fling_last_error_at >= 5 then
+                    warn("[AutoFarm] role fling worker stopped unexpectedly: " .. tostring(err))
+                    role_fling_last_error_at = now
+                end
             end
-            getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
+
             role_fling_thread = nil
+            if not ok and getgenv().AUTOFARM_BAG_FLING_ACTIVE and coin_bags_full() then
+                -- Retry only after an unexpected error; normal exits (dead target or disabled
+                -- role toggle) must stop instead of creating a restart loop.
+                task.delay(0.5, role_fling_step)
+            else
+                getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
+            end
         end)
-    end
-
-    local BAG_ACTION_POSITION = Vector3.new(134.79, 150.45, 8977.42)
-    local bag_action_thread = nil
-    local bag_action_generation = 0
-
-    local function murderer_is_alive()
-        local m = get_round()
-        local data = m and m.PlayerData
-        if type(data) == "table" then
-            for name, info in pairs(data) do
-                if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
-                    if info.Dead == true or info.Killed == true then return false end
-                    local target = Players:FindFirstChild(name)
-                    local hum = target and target.Character and target.Character:FindFirstChildOfClass("Humanoid")
-                    if hum and hum.Health <= 0 then return false end
-                    return true
-                end
-            end
-            return false
-        end
-        return true -- keep trying while role data is temporarily unavailable
-    end
-
-    local function any_living_victim()
-        for _, target in ipairs(Players:GetPlayers()) do
-            if target ~= lp then
-                local char = target.Character
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                if hum and hum.Health > 0 then return true end
-            end
-        end
-        return false
     end
 
     local function post_bag_actions()
-        -- Do not start post-bag actions unless the actual visible bag UI confirms full.
-        if not coin_bags_full() then return end
+        -- Hard safety gate: no fling/kill/shoot actions unless the visible coin bag is full.
+        if not coin_bags_full() then
+            getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
+            role_fling_role = nil
+            return
+        end
         getgenv().AUTOFARM_BAG_FLING_ACTIVE = true
         local bag_role = local_role()
-        if (bag_role == "Sheriff" and fling_murder_sheriff_on)
-            or (bag_role == "Innocent" and fling_murder_innocent_on) then
-            role_fling_role = bag_role
+        if bag_role == "Sheriff" and fling_murder_sheriff_on then
+            role_fling_role = "Sheriff"
             role_fling_step()
+        elseif bag_role == "Innocent" and fling_murder_innocent_on then
+            role_fling_role = "Innocent"
+            role_fling_step()
+        else
+            role_fling_role = nil
         end
-        if bag_action_thread then return end
-        bag_action_generation += 1
-        local my_generation = bag_action_generation
-        bag_action_thread = task.spawn(function()
-            local shoot_started = false
-            while my_generation == bag_action_generation and coin_bags_full() do
-                local char = lp.Character
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                local root = char and char:FindFirstChild("HumanoidRootPart")
-                if root and hum and hum.Health > 0 then
-                    if autoshoot_on or kill_all_on then
-                        pcall(function()
-                            root.CFrame = CFrame.new(BAG_ACTION_POSITION)
-                            root.AssemblyLinearVelocity = Vector3.zero
-                            root.AssemblyAngularVelocity = Vector3.zero
-                        end)
-                    end
-                    if autoshoot_on then
-                        local state = getgenv().SILENT_S
-                        if not shoot_started or (type(state) == "table" and not state.auto_on and murderer_is_alive()) then
-                            pcall(function() getgenv().AUTOSHOOT_START() end)
-                            shoot_started = true
-                        end
-                    end
-                    if kill_all_on then pcall(kill_all) end
-                end
-                -- AutoShoot ends when the Murderer is confirmed dead. AutoKill
-                -- keeps retrying the source knife-touch logic while the bag stays
-                -- full, so temporary missing characters/respawns do not stop it.
-                if autoshoot_on and not kill_all_on and not murderer_is_alive() then break end
-                task.wait(0.15)
+        if kill_all_on then pcall(kill_all) end
+        if autoshoot_on then
+            local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                pcall(function()
+                    hrp.CFrame = CFrame.new(134.79, 150.45, 8977.42)
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
+                end)
             end
-            if shoot_started then pcall(function() getgenv().AUTOSHOOT_STOP() end) end
-            if my_generation == bag_action_generation then bag_action_thread = nil end
-        end)
+            pcall(function() getgenv().AUTOSHOOT_START() end)
+        end
     end
     getgenv().AUTOFARM_BAG_CALLBACK = post_bag_actions
 
@@ -2958,8 +2944,8 @@ do
     })
 
     ExtraSection:Toggle({
-        Title = "AutoKill (Murderer)",
-        Desc = "After a full coin bag, teleports to the action position and repeatedly attacks every living player using the source knife logic.",
+        Title = "Kill All",
+        Desc = "After a full coin bag, kills all living players if you are the Murderer.",
         Flag = "Kill All After Bag",
         Value = farm_config.kill_all,
         Callback = function(v) kill_all_on = v; farm_config_set("kill_all", v) end,
@@ -3026,44 +3012,7 @@ do
     local server_hop_player_limit = math.clamp(tonumber(farm_config.server_hop_player_limit) or 3, 1, 10)
     local server_hop_busy = false
     local server_hop_last_coin = os.clock()
-    local server_hop_retry_after = 0
-    local SERVER_HOP_RETRY_DELAY = 20
     local SERVER_STUCK_TIMEOUT = 6 * 60
-
-    -- Keep a short history across teleports so the player-count rule cannot bounce
-    -- between the same low-population public servers forever.
-    local server_hop_env = getgenv()
-    local server_hop_visited = server_hop_env.__AUTOFARM_VISITED_SERVERS
-    if type(server_hop_visited) ~= "table" then
-        server_hop_visited = {}
-        server_hop_env.__AUTOFARM_VISITED_SERVERS = server_hop_visited
-    end
-    if type(game.JobId) == "string" and game.JobId ~= "" then
-        server_hop_visited[game.JobId] = os.time()
-    end
-
-    local function server_hop_prune_visited()
-        local cutoff = os.time() - 30 * 60
-        local count = 0
-        for id, stamp in pairs(server_hop_visited) do
-            if type(stamp) ~= "number" or stamp < cutoff then
-                server_hop_visited[id] = nil
-            else
-                count += 1
-            end
-        end
-        -- Bound state size in long sessions; older entries are dropped first.
-        if count > 120 then
-            local entries = {}
-            for id, stamp in pairs(server_hop_visited) do
-                entries[#entries + 1] = {id = id, stamp = stamp}
-            end
-            table.sort(entries, function(a, b) return a.stamp < b.stamp end)
-            for i = 1, count - 100 do
-                server_hop_visited[entries[i].id] = nil
-            end
-        end
-    end
 
     local function server_hop_request(url)
         local request_fn = rawget(getgenv(), "request")
@@ -3089,49 +3038,37 @@ do
         return nil
     end
 
-    local function server_hop_find_target(reason)
-        server_hop_prune_visited()
-
-        -- For player-count hops, require a destination strictly above BOTH the
-        -- configured threshold and the population of this server. This guarantees
-        -- progress instead of bouncing between servers at/below the same limit.
-        local current_players = #Players:GetPlayers()
-        local min_population = 0
-        if reason == "players" then
-            min_population = math.max(server_hop_player_limit, current_players)
-        end
-
-        local candidates = {}
-        local seen = {}
+    local function server_hop_find_target(require_more_players)
         local cursor = ""
-        local pages_checked = 0
+        local best_target = nil
+        local best_players = -1
 
-        for _ = 1, 8 do
+        for _ = 1, 10 do
             local url = string.format(
-                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true%s",
+                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100%s",
                 game.PlaceId,
                 cursor ~= "" and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
             )
             local body = server_hop_request(url)
             if not body then break end
             local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-            if not ok or type(data) ~= "table" or type(data.data) ~= "table" then break end
-            pages_checked += 1
+            if not ok or type(data) ~= "table" then break end
 
-            for _, server in ipairs(data.data) do
-                if type(server) == "table" and type(server.id) == "string"
-                    and server.id ~= "" and server.id ~= game.JobId and not seen[server.id]
-                    and not server_hop_visited[server.id] then
-                    local playing = tonumber(server.playing)
-                    local max_players = tonumber(server.maxPlayers)
-                    if playing and max_players and max_players > 0 and playing < max_players
-                        and playing > min_population then
-                        seen[server.id] = true
-                        candidates[#candidates + 1] = {
-                            id = server.id,
-                            playing = playing,
-                            free = max_players - playing,
-                        }
+            for _, server in ipairs(data.data or {}) do
+                if type(server) == "table" and server.id and server.id ~= game.JobId then
+                    local playing = tonumber(server.playing) or 0
+                    local max_players = tonumber(server.maxPlayers) or 0
+                    if max_players > 0 and playing < max_players then
+                        -- For the player-count rule, NEVER fall back to an arbitrary
+                        -- low-population server. With a limit of 3, only 4+ players qualify.
+                        if require_more_players then
+                            if playing > server_hop_player_limit and playing > best_players then
+                                best_target = server.id
+                                best_players = playing
+                            end
+                        else
+                            return server.id
+                        end
                     end
                 end
             end
@@ -3140,27 +3077,10 @@ do
             if cursor == "" then break end
         end
 
-        if #candidates == 0 then
-            if reason == "players" then
-                warn(string.format(
-                    "[server hop] no unvisited public server found with more than %d players after checking %d page(s); retrying in %d seconds",
-                    min_population, pages_checked, SERVER_HOP_RETRY_DELAY
-                ))
-            else
-                warn("[server hop] no unvisited public server candidates found")
-            end
-            return nil
+        if require_more_players then
+            return best_target
         end
-
-        -- Prefer well-populated servers, but choose among the best few to avoid
-        -- always selecting a single full-ish server from the first API page.
-        table.sort(candidates, function(a, b)
-            if a.playing == b.playing then return a.free > b.free end
-            return a.playing > b.playing
-        end)
-        local pool_size = math.min(#candidates, 10)
-        local chosen = candidates[math.random(1, pool_size)]
-        return chosen.id
+        return nil
     end
 
     -- Public raw GitHub source used by queue_on_teleport after server changes.
@@ -3207,7 +3127,6 @@ do
             server_hop_stuck = server_hop_stuck,
             server_hop_players = server_hop_players,
             server_hop_player_limit = server_hop_player_limit,
-            server_hop_visited = server_hop_visited,
         }
 
         local loader = string.format([[
@@ -3254,49 +3173,42 @@ do
                 if type(data.server_hop_player_limit) == "number" then
                     server_hop_player_limit = math.clamp(data.server_hop_player_limit, 1, 10)
                 end
-                if type(data.server_hop_visited) == "table" then
-                    for id, stamp in pairs(data.server_hop_visited) do
-                        if type(id) == "string" and type(stamp) == "number" then
-                            server_hop_visited[id] = stamp
-                        end
-                    end
-                    server_hop_prune_visited()
-                end
             end
             getgenv().__QUEUE_DATA = nil
         end
     end
 
     local function perform_server_hop(reason)
-        if server_hop_busy or os.clock() < server_hop_retry_after then return false end
+        if server_hop_busy then return false end
         server_hop_busy = true
 
-        local target = server_hop_find_target(reason)
-        if not target then
-            -- Do not use Teleport() matchmaking as a fallback for player-count
-            -- hops: it can put us right back in a low-pop server and create a loop.
+        -- Queue the script before every teleport so the new server automatically
+        -- restores the AutoFarm UI and all persisted settings.
+        queue_server_hop_script()
+
+        -- When the player-count rule caused the hop, prefer a server above the configured limit.
+        local require_more_players = reason == "players"
+        local target = server_hop_find_target(require_more_players)
+        if target then
+            local ok = pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, target, lp)
+            end)
+            if ok then return true end
+        elseif require_more_players then
+            -- Do not use generic Teleport here: it can put us into another
+            -- one-player server and defeats the configured player-count rule.
+            warn("[server hop] no public server found above the player limit")
             server_hop_busy = false
-            server_hop_retry_after = os.clock() + SERVER_HOP_RETRY_DELAY
             return false
         end
 
-        -- Record the destination before initiating teleport so a quick failure or
-        -- re-execution does not immediately choose the same instance again.
-        server_hop_visited[target] = os.time()
-        server_hop_prune_visited()
-        queue_server_hop_script()
-
-        local ok, err = pcall(function()
-            TeleportService:TeleportToPlaceInstance(game.PlaceId, target, lp)
+        -- Generic fallback is only allowed for manual/kicked/stuck hops.
+        local ok = pcall(function()
+            TeleportService:Teleport(game.PlaceId, lp)
         end)
-        if ok then
-            return true
-        end
+        if ok then return true end
 
-        warn("[server hop] TeleportToPlaceInstance failed: " .. tostring(err))
-        server_hop_visited[target] = os.time()
         server_hop_busy = false
-        server_hop_retry_after = os.clock() + SERVER_HOP_RETRY_DELAY
         return false
     end
 
@@ -3330,7 +3242,6 @@ do
 
     local teleport_failed_conn = TeleportService.TeleportInitFailed:Connect(function()
         server_hop_busy = false
-        server_hop_retry_after = os.clock() + SERVER_HOP_RETRY_DELAY
     end)
 
     local SettingsSection = SettingsTab:Section({
@@ -3398,7 +3309,7 @@ do
     })
 
     local settings_monitor_conn = RunService.Heartbeat:Connect(function()
-        if server_hop_busy or os.clock() < server_hop_retry_after then return end
+        if server_hop_busy then return end
 
         if server_hop_players and #Players:GetPlayers() <= server_hop_player_limit then
             perform_server_hop("players")
@@ -3441,8 +3352,6 @@ do
         pcall(function() getgenv().AUTOSHOOT_STOP() end)
         kill_all_on=false
         autoshoot_on=false
-        bag_action_generation += 1
-        bag_action_thread = nil
         fling_murder_sheriff_on=false
         fling_murder_innocent_on=false
         role_fling_role=nil
