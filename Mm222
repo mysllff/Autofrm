@@ -829,7 +829,12 @@ do
 				coins_done = true
 				update_hold()
 				if type(getgenv().AUTOFARM_BAG_CALLBACK) == "function" then
-					task.spawn(function() pcall(getgenv().AUTOFARM_BAG_CALLBACK) end)
+					task.spawn(function()
+						local callbackOk, callbackErr = pcall(getgenv().AUTOFARM_BAG_CALLBACK)
+						if not callbackOk then
+							warn("[AutoFarm] Post-bag callback failed: " .. tostring(callbackErr))
+						end
+					end)
 				end
 				auto_reset_for_role()
 			end
@@ -2557,6 +2562,29 @@ do
     local VirtualUser = game:GetService("VirtualUser")
     local CollectionService = game:GetService("CollectionService")
     local lp = Players.LocalPlayer
+
+
+    -- This is deliberately defined in this do-block: the farm's original
+    -- coin_bags_full() is local to the farm do-block and cannot be called here.
+    -- Match the same visible MainGUI/Game/CoinBags/Container/Full check.
+    local function bag_is_full()
+        local pg = lp:FindFirstChild("PlayerGui")
+        local main = pg and pg:FindFirstChild("MainGUI")
+        local gameFrame = main and main:FindFirstChild("Game")
+        local bags = gameFrame and gameFrame:FindFirstChild("CoinBags")
+        local container = bags and bags:FindFirstChild("Container")
+        if not container then return false end
+
+        local foundVisibleBag = false
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Frame") and item.Visible then
+                foundVisibleBag = true
+                local full = item:FindFirstChild("Full")
+                if not (full and full.Visible) then return false end
+            end
+        end
+        return foundVisibleBag
+    end
     local ws = workspace
 
     local kill_all_on = farm_config.kill_all
@@ -2793,7 +2821,7 @@ do
                 -- the corresponding toggle is disabled, or the bag action is explicitly cancelled.
                 while getgenv().AUTOFARM_BAG_FLING_ACTIVE do
                     -- Never run the fling unless the visible bag UI confirms it is full.
-                    if not coin_bags_full() then
+                    if not bag_is_full() then
                         task.wait(0.25)
                         continue
                     end
@@ -2815,9 +2843,28 @@ do
                     if not enabled then break end
 
                     local target, target_info
-                    if type(data) == "table" then
+                    -- Match used.lua's findMurderer(): query the game's GetPlayerData
+                    -- RemoteFunction first, then fall back to CurrentRoundClient.PlayerData.
+                    local getPlayerData = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
+                    if getPlayerData and getPlayerData:IsA("RemoteFunction") then
+                        local okData, serverData = pcall(function()
+                            return getPlayerData:InvokeServer()
+                        end)
+                        if okData and type(serverData) == "table" then
+                            for name, info in pairs(serverData) do
+                                if type(info) == "table" and info.Role == "Murderer"
+                                    and not info.Dead and not info.Killed and name ~= lp.Name then
+                                    target_info = info
+                                    target = Players:FindFirstChild(name)
+                                    if target then break end
+                                end
+                            end
+                        end
+                    end
+                    if not target and type(data) == "table" then
                         for name, info in pairs(data) do
-                            if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
+                            if type(info) == "table" and info.Role == "Murderer"
+                                and not info.Dead and not info.Killed and name ~= lp.Name then
                                 target_info = info
                                 target = Players:FindFirstChild(name)
                                 if target then break end
@@ -2870,7 +2917,7 @@ do
             end
 
             role_fling_thread = nil
-            if not ok and getgenv().AUTOFARM_BAG_FLING_ACTIVE and coin_bags_full() then
+            if not ok and getgenv().AUTOFARM_BAG_FLING_ACTIVE and bag_is_full() then
                 -- Retry only after an unexpected error; normal exits (dead target or disabled
                 -- role toggle) must stop instead of creating a restart loop.
                 task.delay(0.5, role_fling_step)
@@ -2882,7 +2929,7 @@ do
 
     local function post_bag_actions()
         -- Hard safety gate: no fling/kill/shoot actions unless the visible coin bag is full.
-        if not coin_bags_full() then
+        if not bag_is_full() then
             getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
             role_fling_role = nil
             return
