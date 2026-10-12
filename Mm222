@@ -269,7 +269,6 @@ do
 	local was_down = false
 
 	-- Anti-targeting map staging: stay above the active map until its coins spawn.
-	local farm_stage_positions = {
 
 	local farm_stage_normalized = {}
 	for name, pos in pairs(farm_stage_positions) do
