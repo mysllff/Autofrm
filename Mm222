@@ -270,10 +270,7 @@ do
 
 	-- Anti-targeting map staging: stay above the active map until its coins spawn.
 
-	local farm_stage_normalized = {}
-	for name, pos in pairs(farm_stage_positions) do
-		farm_stage_normalized[string.lower((name:gsub("[^%w]", "")))] = { name = name, position = pos }
-	end
+	
 	-- The live map is named "Hotel" in some game builds and "Hotel 2" in others.
 	farm_stage_normalized["hotel"] = { name = "Hotel 2", position = farm_stage_positions["Hotel 2"] }
 	farm_stage_normalized["hotel2"] = { name = "Hotel 2", position = farm_stage_positions["Hotel 2"] }
