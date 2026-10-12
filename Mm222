@@ -262,11 +262,6 @@ do
 	local round_mod = nil
 	local collected_ids = {}
 	local collected_count = 0
-	local total_coins_collected = 0
-	local total_counted_coin_instances = setmetatable({}, { __mode = "k" })
-	local farm_runtime_accumulated = 0
-	local farm_runtime_started_at = nil
-	local stats_loop_running = true
 
 	local farm_mode = (farm_config.farm_type == "Down") and "Down" or "Basic"
 	local farm_speed = tonumber(farm_config.farm_speed) or 23
@@ -275,7 +270,18 @@ do
 
 	-- Anti-targeting map staging: stay above the active map until its coins spawn.
 	local farm_stage_positions = {
-	
+		["Factory"] = Vector3.new(-15.50, 254.82, 8999.22),
+		["Hotel 2"] = Vector3.new(-36.98, 258.45, 9025.54),
+		["Mansion 2"] = Vector3.new(-49.80, 264.44, 8970.55),
+		["Biolab"] = Vector3.new(546.93, 274.27, 9861.57),
+		["Office 3"] = Vector3.new(-87.75, 305.30, 9031.16),
+		["Hospital 3"] = Vector3.new(-46.49, 269.59, 9008.21),
+		["House 2"] = Vector3.new(52.58, 256.70, 8932.28),
+		["Workplace"] = Vector3.new(16.08, 278.46, 9054.51),
+		["Bank 2"] = Vector3.new(33.01, 283.67, 8982.83),
+		["Police station"] = Vector3.new(-8.52, 244.28, 9047.82),
+		["Research Facility"] = Vector3.new(13.28, 278.03, 9056.84),
+		["Mil Base"] = Vector3.new(-58.70, 208.84, 9156.96),
 	}
 	local farm_stage_normalized = {}
 	for name, pos in pairs(farm_stage_positions) do
@@ -290,7 +296,32 @@ do
 	local farm_stage_ready = false
 	local farm_stage_last_teleport = 0
 	local farm_stage_last_teleport_position = nil
+	local farm_stage_locked_root = nil
+	local farm_stage_locked_was_anchored = nil
 	local farm_unknown_stage_position = Vector3.new(14.35, 504.82, -3.25)
+
+	local function farm_stage_unlock()
+		local root = farm_stage_locked_root
+		if root and root.Parent and farm_stage_locked_was_anchored ~= nil then
+			pcall(function() root.Anchored = farm_stage_locked_was_anchored end)
+		end
+		farm_stage_locked_root = nil
+		farm_stage_locked_was_anchored = nil
+	end
+
+	local function farm_stage_lock(root)
+		if not root or not root.Parent then return end
+		if farm_stage_locked_root ~= root then
+			farm_stage_unlock()
+			farm_stage_locked_root = root
+			farm_stage_locked_was_anchored = root.Anchored
+		end
+		pcall(function()
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			root.Anchored = true
+		end)
+	end
 	local down_ref_y = nil
 	local last_touch = 0
 	local DOWN_DEPTH = 14
@@ -323,6 +354,7 @@ do
 
 	local role_reset_busy = false
 	local role_reset_connection = nil
+	local role_reset_cleanup = nil
 
 	local function restore_role_reset_character(character, saved_cframe)
 		if not character then return end
@@ -353,9 +385,13 @@ do
 		local target_head = target_character and target_character:FindFirstChild("Head")
 		local target_humanoid = target_character and target_character:FindFirstChildOfClass("Humanoid")
 		if not (character and humanoid and root and target_character and target_root) then return false end
+		if target_humanoid and target_humanoid.Health <= 0 then return false end
 
 		role_reset_busy = true
 		local saved_cframe = root.CFrame
+		local old_destroy_height = workspace.FallenPartsDestroyHeight
+		local started = os.clock()
+		local cleaned = false
 		humanoid.PlatformStand = true
 		local bv = Instance.new("BodyVelocity")
 		bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
@@ -365,39 +401,59 @@ do
 		bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
 		bg.P = 1000000
 		bg.Parent = root
-		local old_destroy_height = workspace.FallenPartsDestroyHeight
-		workspace.FallenPartsDestroyHeight = -100000
-		local started = os.clock()
+		pcall(function() workspace.FallenPartsDestroyHeight = -100000 end)
+
+		local function cleanup()
+			if cleaned then return end
+			cleaned = true
+			pcall(function() workspace.FallenPartsDestroyHeight = old_destroy_height end)
+			if bv and bv.Parent then pcall(function() bv:Destroy() end) end
+			if bg and bg.Parent then pcall(function() bg:Destroy() end) end
+			if character and character.Parent then
+				pcall(restore_role_reset_character, character, saved_cframe)
+			end
+			if role_reset_connection then pcall(function() role_reset_connection:Disconnect() end) end
+			role_reset_connection = nil
+			role_reset_cleanup = nil
+			role_reset_busy = false
+		end
+		role_reset_cleanup = cleanup
 
 		role_reset_connection = run.Heartbeat:Connect(function()
-			if not humanoid.Parent or humanoid.Health <= 0 or os.clock() - started > 1.5 or not target.Character or not target_root.Parent or (target_humanoid and target_humanoid.Parent and target_humanoid.Health <= 0) then
-				workspace.FallenPartsDestroyHeight = old_destroy_height
-				bv:Destroy()
-				bg:Destroy()
-				if character.Parent then
-					pcall(restore_role_reset_character, character, saved_cframe)
-				end
-				if role_reset_connection then role_reset_connection:Disconnect(); role_reset_connection = nil end
-				role_reset_busy = false
-				return
-			end
+			local ok, should_stop = pcall(function()
+				local stop = not humanoid.Parent or humanoid.Health <= 0
+					or os.clock() - started > 1.5
+					or not target.Character or not target_root.Parent
+					or (target_humanoid and target_humanoid.Parent and target_humanoid.Health <= 0)
+				local live_target_root = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+				if live_target_root and live_target_root ~= target_root then return true end
+				if stop then return true end
 
-			local head_pos = target_head and target_head.Position or (target_root.Position + Vector3.new(0, 2.5, 0))
-			root.CFrame = CFrame.new(head_pos)
-			root.AssemblyLinearVelocity = Vector3.new(0, -50000, 0)
-			root.AssemblyAngularVelocity = Vector3.new(7500, 7500, 7500)
-			if type(firetouchinterest) == "function" then
-				for _ = 1, 5 do
-					pcall(firetouchinterest, root, target_root, 0)
-					pcall(firetouchinterest, root, target_root, 1)
-					if target_head then
-						pcall(firetouchinterest, root, target_head, 0)
-						pcall(firetouchinterest, root, target_head, 1)
+				local head_pos = target_head and target_head.Parent and target_head.Position
+					or (target_root.Position + Vector3.new(0, 2.5, 0))
+				root.CFrame = CFrame.new(head_pos)
+				root.AssemblyLinearVelocity = Vector3.new(0, -50000, 0)
+				root.AssemblyAngularVelocity = Vector3.new(7500, 7500, 7500)
+				if type(firetouchinterest) == "function" then
+					for _ = 1, 5 do
+						pcall(firetouchinterest, root, target_root, 0)
+						pcall(firetouchinterest, root, target_root, 1)
+						if target_head and target_head.Parent then
+							pcall(firetouchinterest, root, target_head, 0)
+							pcall(firetouchinterest, root, target_head, 1)
+						end
 					end
 				end
-			end
-			if type(sethiddenproperty) == "function" then
-				pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root)
+				if type(sethiddenproperty) == "function" then
+					pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root)
+				end
+				return false
+			end)
+			if not ok then
+				warn("[AutoFarm] Fling heartbeat error: " .. tostring(should_stop))
+				cleanup()
+			elseif should_stop then
+				cleanup()
 			end
 		end)
 		return true
@@ -478,6 +534,7 @@ do
 	end)
 
 	lp.CharacterAdded:Connect(function()
+		farm_stage_unlock()
 		reset_farm_progress(getgenv().AUTOFARM_BAG_FLING_ACTIVE)
 	end)
 
@@ -555,24 +612,44 @@ do
 		local now = os.clock()
 		local same_position = farm_stage_last_teleport_position
 			and (farm_stage_last_teleport_position - position).Magnitude < 1
-		if same_position and (hrp.Position - position).Magnitude <= 8 then
+		if same_position and farm_stage_locked_root == hrp and (hrp.Position - position).Magnitude <= 8 then
+			farm_stage_lock(hrp)
 			return true
 		end
-		-- If the game overwrites our CFrame during round start, correct it at most once per 0.9s.
+		-- Anchor only while waiting for the round/map to initialize. Noclip + PlatformStand
+		-- let gravity pull the character down, causing the old fall/teleport loop.
 		if same_position and now - farm_stage_last_teleport < 0.9 then
+			farm_stage_lock(hrp)
 			return false
 		end
-		set_farm_noclip(true)
+		farm_stage_lock(hrp)
 		local ok = pcall(function()
 			hrp.CFrame = CFrame.new(position)
 			hrp.AssemblyLinearVelocity = Vector3.zero
 			hrp.AssemblyAngularVelocity = Vector3.zero
+			hrp.Anchored = true
 		end)
 		if ok then
 			farm_stage_last_teleport = now
 			farm_stage_last_teleport_position = position
 		end
 		return ok
+	end
+
+	local function farm_unknown_map_position(coins)
+		if not coins or #coins == 0 then return nil end
+		local sx, sy, sz, maxY, count = 0, 0, 0, -math.huge, 0
+		for _, coin in ipairs(coins) do
+			if coin and coin.Parent and coin:IsA("BasePart") then
+				local pos = coin.Position
+				sx, sy, sz = sx + pos.X, sy + pos.Y, sz + pos.Z
+				maxY = math.max(maxY, pos.Y)
+				count = count + 1
+			end
+		end
+		if count == 0 then return nil end
+		-- Unknown map: use the live coin cluster as a grounded map locator, not a random spawn.
+		return Vector3.new(sx / count, maxY + 24, sz / count)
 	end
 
 	local function available_coins()
@@ -647,6 +724,7 @@ do
 	end
 
 	local function farm_release()
+		farm_stage_unlock()
 		if was_down then
 			was_down = false
 			return_to_surface()
@@ -782,31 +860,41 @@ do
 		if not can_farm() then
 			farm_target = nil
 			was_down = false
+			farm_stage_unlock()
 			set_farm_noclip(false)
 			return
 		end
 		local hrp = farm_hrp()
 		if not hrp then return end
 
-		-- The game may force a spawn point immediately after map teleport.
-		-- Keep reapplying the map-specific airborne position until CoinVisuals exist.
+		-- Stage in a fixed position until the round creates CoinVisuals. The old
+		-- noclip/PlatformStand staging let gravity pull the character down between teleports.
 		local stage_name, stage_pos = find_active_farm_map()
-		if not stage_name and not farm_stage_ready and #available_coins() == 0 then
-			-- Unknown-map anti-targeting: remain at the high safe point and wait for coins.
-			-- Do not guess a SpawnLocation; that used to teleport the player to a random point
-			-- and repeatedly fight the game's round-start spawn correction.
-			farm_stage_to_map(farm_unknown_stage_position)
-			return
-		end
-		if stage_pos and not farm_stage_ready then
-			if #available_coins() == 0 then
-				stage_before_coins()
+		local stage_coins = available_coins()
+		if not farm_stage_ready then
+			if #stage_coins == 0 then
+				if stage_pos then
+					stage_before_coins()
+				else
+					farm_stage_to_map(farm_unknown_stage_position)
+				end
 				return
 			end
-			farm_stage_ready = true
-			set_farm_noclip(false)
-			hrp = farm_hrp()
-			if not hrp then return end
+			if stage_pos then
+				farm_stage_ready = true
+				farm_stage_unlock()
+				set_farm_noclip(false)
+					hrp = farm_hrp()
+				if not hrp then return end
+			else
+				local inferred_position = farm_unknown_map_position(stage_coins)
+				if inferred_position then farm_stage_to_map(inferred_position) end
+				farm_stage_ready = true
+				farm_stage_unlock()
+				set_farm_noclip(false)
+					hrp = farm_hrp()
+				if not hrp then return end
+			end
 		end
 
 		local list = {}
@@ -817,10 +905,6 @@ do
 					if id and not collected_ids[id] then
 						collected_ids[id] = true
 						collected_count = collected_count + 1
-						if not total_counted_coin_instances[v] then
-							total_counted_coin_instances[v] = true
-							 total_coins_collected = total_coins_collected + 1
-						end
 					end
 				elseif not v:GetAttribute("Delete") then
 					list[#list + 1] = v
@@ -942,12 +1026,6 @@ do
         Flag = "Auto Farm",
         Value = farm_config.auto_farm,
         Callback = function(v)
-            if v and not autofarm_on then
-                farm_runtime_started_at = os.clock()
-            elseif not v and autofarm_on and farm_runtime_started_at then
-                farm_runtime_accumulated = farm_runtime_accumulated + math.max(0, os.clock() - farm_runtime_started_at)
-                farm_runtime_started_at = nil
-            end
             autofarm_on = v
             farm_config_set("auto_farm", v)
             reset_farm_progress()
@@ -1040,48 +1118,14 @@ do
         Callback = function(v) autoreset_innocent_on = v; farm_config_set("auto_reset_innocent", v) end
     })
 
-    -- Live farming statistics: total collected coins and cumulative time with Farm enabled.
-    local StatsSection = AutoFarmTab:Section({Title = "Stats", Box = true, Opened = true})
-    local function get_farm_runtime()
-        local elapsed = farm_runtime_accumulated
-        if farm_runtime_started_at then
-            elapsed = elapsed + math.max(0, os.clock() - farm_runtime_started_at)
-        end
-        return elapsed
-    end
-    local function format_runtime(seconds)
-        seconds = math.max(0, math.floor(seconds))
-        local hours = math.floor(seconds / 3600)
-        local minutes = math.floor((seconds % 3600) / 60)
-        local secs = seconds % 60
-        return string.format("%02d:%02d:%02d", hours, minutes, secs)
-    end
-    local function stats_description()
-        local runtime = get_farm_runtime()
-        local coins_per_hour = runtime > 0 and (total_coins_collected * 3600 / runtime) or 0
-        return string.format("Coins collected: %d\nCoins per hour: %.1f\nFarm runtime: %s",
-            total_coins_collected, coins_per_hour, format_runtime(runtime))
-    end
-    local StatsParagraph = StatsSection:Paragraph({
-        Title = "Farm Statistics",
-        Desc = stats_description(),
-    })
-    task.spawn(function()
-        while stats_loop_running do
-            task.wait(1)
-            if StatsParagraph then
-                pcall(function() StatsParagraph:SetDesc(stats_description()) end)
-            end
-        end
-    end)
-
     getgenv().AUTOFARM_UNLOAD = function()
-        stats_loop_running = false
         autofarm_on = false
         autoreset_sheriff_on = false
         autoreset_murderer_on = false
         autoreset_innocent_on = false
-        if role_reset_connection then
+        if role_reset_cleanup then
+            pcall(role_reset_cleanup)
+        elseif role_reset_connection then
             pcall(function() role_reset_connection:Disconnect() end)
             role_reset_connection = nil
         end
@@ -1100,6 +1144,7 @@ do
             farm_conn = nil
         end
 
+        farm_stage_unlock()
         farm_release()
     end
 
@@ -1113,9 +1158,6 @@ do
     farm_mode = (farm_config.farm_type == "Down") and "Down" or "Basic"
     autograb_on = farm_config.grab_gun
     autofarm_on = farm_config.auto_farm
-    if autofarm_on and not farm_runtime_started_at then
-        farm_runtime_started_at = os.clock()
-    end
     avoid_murder = farm_config.murder_check
     autoreset_sheriff_on = farm_config.auto_reset_sheriff
     autoreset_murderer_on = farm_config.auto_reset_murderer
@@ -2732,11 +2774,31 @@ do
         end
     end)
 
-    -- Anti-Fling from the source.
+    -- Anti-Fling: source registration/sweep logic plus a safe-position guard.
     local fling_cache = {}
     local fling_reg = {}
     local fling_conns = {}
+    local fling_attached = false
+    local fling_safe_cf = nil
+    local fling_hold_until = 0
+    local fling_active_since = 0
     local FLING_MAX_VEL, FLING_MAX_ANG = 700, 90
+    local FLING_SNAP_DIST, FLING_HOLD, FLING_SAFE_VEL = 60, 0.25, 250
+
+    local function fling_busy()
+        if getgenv().AUTOFARM_BAG_FLING_ACTIVE then return true end
+        if os.clock() < (getgenv().VELOCITY_DESYNC_UNTIL or 0) then return true end
+        if (getgenv().FLING_ACTIVE or 0) > 0 then
+            local now = os.clock()
+            if fling_active_since == 0 then fling_active_since = now end
+            if now - fling_active_since < 20 then return true end
+            getgenv().FLING_ACTIVE = 0
+            fling_active_since = 0
+            return false
+        end
+        fling_active_since = 0
+        return false
+    end
 
     local function fling_kill_part(part)
         if fling_cache[part] == nil then fling_cache[part] = part.CanCollide end
@@ -2747,46 +2809,151 @@ do
         local entry = fling_reg[model]
         if not entry then return end
         fling_reg[model] = nil
-        for _, c in ipairs(entry.conns) do pcall(function() c:Disconnect() end) end
+        for _, conn in ipairs(entry.conns) do pcall(function() conn:Disconnect() end) end
         for part in pairs(entry.parts) do
             local old = fling_cache[part]
             fling_cache[part] = nil
             if old ~= nil and part.Parent then pcall(function() part.CanCollide = old end) end
         end
+        table.clear(entry.parts)
     end
 
     local function fling_register(model)
         if not anti_fling or not model or model == lp.Character or fling_reg[model] then return end
         local entry = {parts = {}, conns = {}}
         fling_reg[model] = entry
-        local function add(d)
-            if d:IsA("BasePart") and not entry.parts[d] then
-                entry.parts[d] = true
-                pcall(fling_kill_part, d)
+        local function add(descendant)
+            if descendant:IsA("BasePart") and not entry.parts[descendant] then
+                entry.parts[descendant] = true
+                if anti_fling then pcall(fling_kill_part, descendant) end
             end
         end
-        for _, d in ipairs(model:GetDescendants()) do pcall(add, d) end
-        entry.conns[#entry.conns+1] = model.DescendantAdded:Connect(function(d) if anti_fling then pcall(add,d) end end)
-        entry.conns[#entry.conns+1] = model.DescendantRemoving:Connect(function(d) entry.parts[d]=nil; fling_cache[d]=nil end)
-        entry.conns[#entry.conns+1] = model.AncestryChanged:Connect(function(_, parent) if not parent then fling_unregister(model) end end)
+        for _, descendant in ipairs(model:GetDescendants()) do pcall(add, descendant) end
+        entry.conns[#entry.conns + 1] = model.DescendantAdded:Connect(function(descendant)
+            if anti_fling then pcall(add, descendant) end
+        end)
+        entry.conns[#entry.conns + 1] = model.DescendantRemoving:Connect(function(descendant)
+            entry.parts[descendant] = nil
+            fling_cache[descendant] = nil
+        end)
+        entry.conns[#entry.conns + 1] = model.AncestryChanged:Connect(function(_, parent)
+            if not parent then fling_unregister(model) end
+        end)
+    end
+
+    local function fling_is_body(model)
+        return model ~= lp.Character and model:IsA("Model")
+            and model:FindFirstChildOfClass("Humanoid") ~= nil
     end
 
     local function fling_scan()
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp and plr.Character then fling_register(plr.Character) end
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= lp and player.Character then fling_register(player.Character) end
         end
-        for _, m in ipairs(ws:GetChildren()) do
-            if m:IsA("Model") and m ~= lp.Character and m:FindFirstChildOfClass("Humanoid") then fling_register(m) end
+        for _, model in ipairs(ws:GetChildren()) do
+            if fling_is_body(model) then fling_register(model) end
         end
     end
 
+    local function fling_sweep()
+        for model, entry in pairs(fling_reg) do
+            if not model.Parent or model == lp.Character then
+                fling_unregister(model)
+            else
+                for part in pairs(entry.parts) do
+                    if part.Parent then
+                        if part.CanCollide then
+                            if fling_cache[part] == nil then fling_cache[part] = true end
+                            part.CanCollide = false
+                        end
+                    else
+                        entry.parts[part] = nil
+                        fling_cache[part] = nil
+                    end
+                end
+            end
+        end
+    end
+
+    local function fling_guard(full)
+        local character = lp.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not root or not root.Parent then
+            fling_safe_cf = nil
+            return
+        end
+        -- Do not cancel our own bag-triggered fling or another active velocity action.
+        if fling_busy() then
+            fling_safe_cf = nil
+            return
+        end
+        local linear = root.AssemblyLinearVelocity
+        local angular = root.AssemblyAngularVelocity
+        local spike = linear.Magnitude > FLING_MAX_VEL or angular.Magnitude > FLING_MAX_ANG
+        local now = os.clock()
+        if spike then fling_hold_until = now + FLING_HOLD end
+        if spike or now < fling_hold_until then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            if full and fling_safe_cf and (root.Position - fling_safe_cf.Position).Magnitude > FLING_SNAP_DIST then
+                root.CFrame = fling_safe_cf
+            end
+        elseif full and linear.Magnitude < FLING_SAFE_VEL then
+            fling_safe_cf = root.CFrame
+        end
+    end
+
+    local function fling_detach()
+        fling_attached = false
+        for _, conn in ipairs(fling_conns) do pcall(function() conn:Disconnect() end) end
+        table.clear(fling_conns)
+    end
+
+    local function fling_attach()
+        if fling_attached then return end
+        fling_attached = true
+        local function push(conn) fling_conns[#fling_conns + 1] = conn end
+        local function watch(player)
+            if player == lp then return end
+            push(player.CharacterAdded:Connect(function(character)
+                if anti_fling then fling_register(character) end
+            end))
+            push(player.CharacterRemoving:Connect(function(character)
+                fling_unregister(character)
+            end))
+        end
+        for _, player in ipairs(Players:GetPlayers()) do watch(player) end
+        push(Players.PlayerAdded:Connect(function(player)
+            watch(player)
+            if anti_fling and player.Character then fling_register(player.Character) end
+        end))
+        push(Players.PlayerRemoving:Connect(function(player)
+            if player.Character then fling_unregister(player.Character) end
+        end))
+        push(ws.ChildAdded:Connect(function(model)
+            if not anti_fling then return end
+            task.defer(function()
+                if anti_fling and model.Parent == ws and fling_is_body(model) then fling_register(model) end
+            end)
+        end))
+        push(lp.CharacterAdded:Connect(function()
+            fling_safe_cf = nil
+            fling_hold_until = 0
+            if anti_fling then task.defer(fling_scan) end
+        end))
+        fling_scan()
+    end
+
     local function fling_restore()
+        fling_detach()
         for model in pairs(fling_reg) do fling_unregister(model) end
         table.clear(fling_reg)
         for part, old in pairs(fling_cache) do
-            if part.Parent then pcall(function() part.CanCollide = old end) end
+            if part and part.Parent then pcall(function() part.CanCollide = old end) end
         end
         table.clear(fling_cache)
+        fling_safe_cf = nil
+        fling_hold_until = 0
     end
 
     -- Anti-Void uses the same world-limit behavior as the source.
@@ -3075,7 +3242,7 @@ do
     ProtectionSection:Toggle({Title="Anti-Fling", Flag="Anti-Fling", Value=farm_config.anti_fling, Callback=function(v)
         anti_fling=v
         farm_config_set("anti_fling", v)
-        if v then fling_scan() else fling_restore() end
+        if v then fling_attach() else fling_restore() end
     end})
     ProtectionSection:Toggle({Title="Anti-Void", Flag="Anti-Void", Value=farm_config.anti_void, Callback=function(v) set_void(v); farm_config_set("anti_void", v) end})
     ProtectionSection:Toggle({Title="Anti-Trap", Flag="Anti-Trap", Value=farm_config.anti_trap, Callback=function(v)
@@ -3103,7 +3270,7 @@ do
     -- Persisted AutoFarm settings are initialized in their own scope above.
     -- Run the same side effects that the callbacks perform.
     apply_fps()
-    if anti_fling then fling_scan() end
+    if anti_fling then fling_attach() end
     if anti_void then set_void(true) end
     if anti_trap then trap_attach() end
     if disable_render then apply_render() end
@@ -3429,28 +3596,12 @@ do
 
     local fling_step = RunService.Stepped:Connect(function()
         if not anti_fling then return end
-        if next(fling_reg) == nil then fling_scan() end
-        for model, entry in pairs(fling_reg) do
-            if not model.Parent then
-                fling_unregister(model)
-            else
-                for part in pairs(entry.parts) do
-                    if part.Parent then
-                        if part.CanCollide then pcall(function() part.CanCollide=false end) end
-                    else entry.parts[part]=nil end
-                end
-            end
-        end
-        local char=lp.Character
-        local hrp=char and char:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local lin=hrp.AssemblyLinearVelocity
-            local ang=hrp.AssemblyAngularVelocity
-            if lin.Magnitude>FLING_MAX_VEL or ang.Magnitude>FLING_MAX_ANG then
-                hrp.AssemblyLinearVelocity=Vector3.zero
-                hrp.AssemblyAngularVelocity=Vector3.zero
-            end
-        end
+        if not fling_attached then pcall(fling_attach) end
+        pcall(fling_sweep)
+        pcall(fling_guard, true)
+    end)
+    local fling_heartbeat = RunService.Heartbeat:Connect(function()
+        if anti_fling then pcall(fling_guard, false) end
     end)
 
     getgenv().AUTOFARM_EXTRAS_UNLOAD = function()
@@ -3473,6 +3624,7 @@ do
         reset_fps()
         if idle_conn then pcall(function() idle_conn:Disconnect() end); idle_conn=nil end
         if fling_step then pcall(function() fling_step:Disconnect() end); fling_step=nil end
+        if fling_heartbeat then pcall(function() fling_heartbeat:Disconnect() end); fling_heartbeat=nil end
         if settings_monitor_conn then pcall(function() settings_monitor_conn:Disconnect() end); settings_monitor_conn=nil end
         if server_coin_added_conn then pcall(function() server_coin_added_conn:Disconnect() end); server_coin_added_conn=nil end
         if server_desc_coin_conn then pcall(function() server_desc_coin_conn:Disconnect() end); server_desc_coin_conn=nil end
