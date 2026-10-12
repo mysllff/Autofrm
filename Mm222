@@ -270,19 +270,7 @@ do
 
 	-- Anti-targeting map staging: stay above the active map until its coins spawn.
 	local farm_stage_positions = {
-		["Factory"] = Vector3.new(-15.50, 254.82, 8999.22),
-		["Hotel 2"] = Vector3.new(-36.98, 258.45, 9025.54),
-		["Mansion 2"] = Vector3.new(-49.80, 264.44, 8970.55),
-		["Biolab"] = Vector3.new(546.93, 274.27, 9861.57),
-		["Office 3"] = Vector3.new(-87.75, 305.30, 9031.16),
-		["Hospital 3"] = Vector3.new(-46.49, 269.59, 9008.21),
-		["House 2"] = Vector3.new(52.58, 256.70, 8932.28),
-		["Workplace"] = Vector3.new(16.08, 278.46, 9054.51),
-		["Bank 2"] = Vector3.new(33.01, 283.67, 8982.83),
-		["Police station"] = Vector3.new(-8.52, 244.28, 9047.82),
-		["Research Facility"] = Vector3.new(13.28, 278.03, 9056.84),
-		["Mil Base"] = Vector3.new(-58.70, 208.84, 9156.96),
-	}
+
 	local farm_stage_normalized = {}
 	for name, pos in pairs(farm_stage_positions) do
 		farm_stage_normalized[string.lower((name:gsub("[^%w]", "")))] = { name = name, position = pos }
