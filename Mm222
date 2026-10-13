@@ -270,18 +270,18 @@ do
 
 	-- Anti-targeting map staging: stay above the active map until its coins spawn.
 	local farm_stage_positions = {
-		["dildo1"] = Vector3.new(-15.50, 254.82, 8999.22),
-		["dildo2"] = Vector3.new(-36.98, 258.45, 9025.54),
-		["dildo3"] = Vector3.new(-49.80, 264.44, 8970.55),
-		["dildo4"] = Vector3.new(546.93, 274.27, 9861.57),
-		["dildo5"] = Vector3.new(-87.75, 305.30, 9031.16),
-		["dildo6"] = Vector3.new(-46.49, 269.59, 9008.21),
-		["dildo7"] = Vector3.new(52.58, 256.70, 8932.28),
-		["dildo8"] = Vector3.new(16.08, 278.46, 9054.51),
-		["dildo9"] = Vector3.new(33.01, 283.67, 8982.83),
-		["dildo10"] = Vector3.new(-8.52, 244.28, 9047.82),
-		["dildo11"] = Vector3.new(13.28, 278.03, 9056.84),
-		["dildo12"] = Vector3.new(-58.70, 208.84, 9156.96),
+		["Factory"] = Vector3.new(-15.50, 254.82, 8999.22),
+		["Hotel 2"] = Vector3.new(-36.98, 258.45, 9025.54),
+		["Mansion 2"] = Vector3.new(-49.80, 264.44, 8970.55),
+		["Biolab"] = Vector3.new(546.93, 274.27, 9861.57),
+		["Office 3"] = Vector3.new(-87.75, 305.30, 9031.16),
+		["Hospital 3"] = Vector3.new(-46.49, 269.59, 9008.21),
+		["House 2"] = Vector3.new(52.58, 256.70, 8932.28),
+		["Workplace"] = Vector3.new(16.08, 278.46, 9054.51),
+		["Bank 2"] = Vector3.new(33.01, 283.67, 8982.83),
+		["Police station"] = Vector3.new(-8.52, 244.28, 9047.82),
+		["Research Facility"] = Vector3.new(13.28, 278.03, 9056.84),
+		["Mil Base"] = Vector3.new(-58.70, 208.84, 9156.96),
 	}
 	local farm_stage_normalized = {}
 	for name, pos in pairs(farm_stage_positions) do
@@ -346,10 +346,20 @@ do
 		return round_mod and round_mod.PlayerData
 	end
 
+	local function local_has_gun()
+		local character = lp.Character
+		local backpack = lp:FindFirstChildOfClass("Backpack")
+		return (character and character:FindFirstChild("Gun") ~= nil)
+			or (backpack and backpack:FindFirstChild("Gun") ~= nil) or false
+	end
+
 	local function local_role()
 		local d = get_round_data()
 		local me = type(d) == "table" and d[lp.Name]
-		return me and me.Role, me
+		local role = me and me.Role
+		-- The held/inventory gun is authoritative while round role data is stale.
+		if local_has_gun() then role = "Sheriff" end
+		return role, me
 	end
 
 	local role_reset_busy = false
@@ -379,84 +389,96 @@ do
 		if not target or target == lp or role_reset_busy then return false end
 		local character = lp.Character
 		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		local root = humanoid and humanoid.RootPart
+		local root = character and (character:FindFirstChild("HumanoidRootPart") or humanoid and humanoid.RootPart)
 		local target_character = target.Character
-		local target_root = target_character and target_character:FindFirstChild("HumanoidRootPart")
-		local target_head = target_character and target_character:FindFirstChild("Head")
-		local target_humanoid = target_character and target_character:FindFirstChildOfClass("Humanoid")
+		local target_root = target_character and (target_character:FindFirstChild("HumanoidRootPart") or target_character:FindFirstChild("Head"))
+		local target_humanoid = target_character and target_character:FindFirstChildOfClass("Humanoid")		
 		if not (character and humanoid and root and target_character and target_root) then return false end
-		if target_humanoid and target_humanoid.Health <= 0 then return false end
+		if target_humanoid and (target_humanoid.Health <= 0 or target_humanoid.Sit) then return false end
 
 		role_reset_busy = true
 		local saved_cframe = root.CFrame
 		local old_destroy_height = workspace.FallenPartsDestroyHeight
-		local started = os.clock()
-		local cleaned = false
-		humanoid.PlatformStand = true
-		local bv = Instance.new("BodyVelocity")
-		bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-		bv.Velocity = Vector3.new(0, -50000, 0)
-		bv.Parent = root
-		local bg = Instance.new("BodyGyro")
-		bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-		bg.P = 1000000
-		bg.Parent = root
-		pcall(function() workspace.FallenPartsDestroyHeight = -100000 end)
-
+		local camera = workspace.CurrentCamera
+		local old_camera_subject = camera and camera.CameraSubject
+		local old_seated = humanoid:GetStateEnabled(Enum.HumanoidStateType.Seated)
+		local old_platform_stand = humanoid.PlatformStand
+		local old_primary = character.PrimaryPart
+		local bv, cleaned = nil, false
+		local old_fling_active = tonumber(getgenv().FLING_ACTIVE) or 0
+		getgenv().FLING_ACTIVE = old_fling_active + 1
+		getgenv().OldPos = saved_cframe
 		local function cleanup()
 			if cleaned then return end
 			cleaned = true
-			pcall(function() workspace.FallenPartsDestroyHeight = old_destroy_height end)
 			if bv and bv.Parent then pcall(function() bv:Destroy() end) end
-			if bg and bg.Parent then pcall(function() bg:Destroy() end) end
-			if character and character.Parent then
-				pcall(restore_role_reset_character, character, saved_cframe)
+			pcall(function() workspace.FallenPartsDestroyHeight = old_destroy_height end)
+			if camera and camera.Parent then pcall(function() camera.CameraSubject = old_camera_subject or humanoid end) end
+			if humanoid and humanoid.Parent then
+				pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, old_seated) end)
+				humanoid.PlatformStand = old_platform_stand
+			end
+			if character and character.Parent and root and root.Parent then
+				pcall(function()
+					if old_primary and old_primary.Parent == character then character.PrimaryPart = old_primary end
+					root.CFrame = saved_cframe
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.AssemblyAngularVelocity = Vector3.zero
+					humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+				end)
 			end
 			if role_reset_connection then pcall(function() role_reset_connection:Disconnect() end) end
 			role_reset_connection = nil
 			role_reset_cleanup = nil
+			getgenv().FLING_ACTIVE = math.max(0, (tonumber(getgenv().FLING_ACTIVE) or 1) - 1)
 			role_reset_busy = false
 		end
 		role_reset_cleanup = cleanup
-
-		role_reset_connection = run.Heartbeat:Connect(function()
-			local ok, should_stop = pcall(function()
-				local stop = not humanoid.Parent or humanoid.Health <= 0
-					or os.clock() - started > 1.5
-					or not target.Character or not target_root.Parent
-					or (target_humanoid and target_humanoid.Parent and target_humanoid.Health <= 0)
-				local live_target_root = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
-				if live_target_root and live_target_root ~= target_root then return true end
-				if stop then return true end
-
-				local head_pos = target_head and target_head.Parent and target_head.Position
-					or (target_root.Position + Vector3.new(0, 2.5, 0))
-				root.CFrame = CFrame.new(head_pos)
-				root.AssemblyLinearVelocity = Vector3.new(0, -50000, 0)
-				root.AssemblyAngularVelocity = Vector3.new(7500, 7500, 7500)
-				if type(firetouchinterest) == "function" then
-					for _ = 1, 5 do
-						pcall(firetouchinterest, root, target_root, 0)
-						pcall(firetouchinterest, root, target_root, 1)
-						if target_head and target_head.Parent then
-							pcall(firetouchinterest, root, target_head, 0)
-							pcall(firetouchinterest, root, target_head, 1)
-						end
+		local ok, err = xpcall(function()
+			if camera then camera.CameraSubject = target_root end
+			pcall(function() workspace.FallenPartsDestroyHeight = 0/0 end)
+			bv = Instance.new("BodyVelocity")
+			bv.Velocity = Vector3.zero
+			bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+			bv.Parent = root
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+			local deadline = os.clock() + 2
+			local angle = 0
+			while os.clock() < deadline and getgenv().AUTOFARM_BAG_FLING_ACTIVE do
+				if not target.Parent or target.Character ~= target_character or not target_root.Parent
+					or (target_humanoid and (not target_humanoid.Parent or target_humanoid.Health <= 0))
+					or not root.Parent or humanoid.Health <= 0 then break end
+				local move = target_humanoid and target_humanoid.MoveDirection or Vector3.zero
+				local target_velocity = target_root.AssemblyLinearVelocity
+				local offsets
+				if target_velocity.Magnitude < 50 then
+					angle += 100
+					offsets = {Vector3.new(0, 1.5, 0), Vector3.new(0, -1.5, 0), Vector3.new(0, 1.5, 0), Vector3.new(0, -1.5, 0), Vector3.new(0, 1.5, 0), Vector3.new(0, -1.5, 0)}
+				else
+				offsets = {Vector3.new(0, 1.5, target_humanoid and target_humanoid.WalkSpeed or 0), Vector3.new(0, -1.5, -(target_humanoid and target_humanoid.WalkSpeed or 0)), Vector3.new(0, 1.5, target_humanoid and target_humanoid.WalkSpeed or 0), Vector3.new(0, -1.5, 0)}
+				end
+				for i, offset in ipairs(offsets) do
+					if os.clock() >= deadline or not getgenv().AUTOFARM_BAG_FLING_ACTIVE then break end
+					local live_pos = target_root.Position
+					local position = live_pos + offset + move * math.min(target_velocity.Magnitude / 1.25, 8)
+					local rotation = target_velocity.Magnitude < 50 and CFrame.Angles(math.rad(angle), 0, 0) or CFrame.Angles(math.rad(i % 2 == 1 and 90 or 0), 0, 0)
+					root.CFrame = CFrame.new(position) * rotation
+					pcall(function() character:SetPrimaryPartCFrame(root.CFrame) end)
+					root.Velocity = Vector3.new(9e7, 9e8, 9e7)
+					root.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+					if type(sethiddenproperty) == "function" then pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root) end
+					if type(firetouchinterest) == "function" then
+						pcall(firetouchinterest, root, target_root, 0); pcall(firetouchinterest, root, target_root, 1)
+						local head = target_character:FindFirstChild("Head")
+						if head then pcall(firetouchinterest, root, head, 0); pcall(firetouchinterest, root, head, 1) end
 					end
+					task.wait()
 				end
-				if type(sethiddenproperty) == "function" then
-					pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root)
-				end
-				return false
-			end)
-			if not ok then
-				warn("[AutoFarm] Fling heartbeat error: " .. tostring(should_stop))
-				cleanup()
-			elseif should_stop then
-				cleanup()
 			end
-		end)
-		return true
+		end, debug.traceback)
+		cleanup()
+		if not ok then warn("[AutoFarm] Fling error: " .. tostring(err)) end
+		return ok
 	end
 	getgenv().AUTOFARM_ROLE_FLING = reset_player_target
 
@@ -2577,10 +2599,22 @@ do
 				pcall(refresh_target)
 			end)
 		end
-		watch_conns[#watch_conns + 1] = lp.CharacterAdded:Connect(function()
+		watch_conns[#watch_conns + 1] = lp.CharacterAdded:Connect(function(character)
 			task.wait(0.3)
 			pcall(refresh_target)
+			watch_conns[#watch_conns + 1] = character.ChildAdded:Connect(function(child)
+				if child.Name == "Gun" then task.defer(refresh_target) end
+			end)
 		end)
+		local backpack = lp:FindFirstChildOfClass("Backpack")
+		if backpack then
+			watch_conns[#watch_conns + 1] = backpack.ChildAdded:Connect(function(child)
+				if child.Name == "Gun" then task.defer(refresh_target) end
+			end)
+			watch_conns[#watch_conns + 1] = backpack.ChildRemoved:Connect(function(child)
+				if child.Name == "Gun" then task.defer(refresh_target) end
+			end)
+		end
 	end
 
 	local next_role = 0
@@ -2707,11 +2741,20 @@ do
         return round_mod
     end
 
+    local function local_has_gun()
+        local character = lp.Character
+        local backpack = lp:FindFirstChildOfClass("Backpack")
+        return (character and character:FindFirstChild("Gun") ~= nil)
+            or (backpack and backpack:FindFirstChild("Gun") ~= nil) or false
+    end
+
     local function local_role()
         local m = get_round()
         local data = m and m.PlayerData
         local me = type(data) == "table" and data[lp.Name]
-        return me and me.Role, me
+        local role = me and me.Role
+        if local_has_gun() then role = "Sheriff" end
+        return role, me
     end
 
     local function ensure_knife_equipped()
@@ -3057,6 +3100,7 @@ do
                     local data = round and round.PlayerData
                     local me = type(data) == "table" and data[lp.Name]
                     local role = me and me.Role
+                    if local_has_gun() then role = "Sheriff" end
                     -- Round data can briefly disappear during respawn/role refresh; retry
                     -- instead of terminating the only post-bag fling worker.
                     if not role then
@@ -3099,7 +3143,7 @@ do
 
                     -- Do not fling during the lobby/device-selection phase. Require valid role
                     -- data for both players and a live Murderer character before engaging.
-                    local valid_local_role = me and (me.Role == "Sheriff" or me.Role == "Innocent")
+                    local valid_local_role = role == "Sheriff" or role == "Innocent"
                     if not valid_local_role or not target or not target_info
                         or target_info.Role ~= "Murderer" then
                         task.wait(0.25)
@@ -3284,7 +3328,27 @@ do
     local server_hop_player_limit = math.clamp(tonumber(farm_config.server_hop_player_limit) or 3, 1, 10)
     local server_hop_busy = false
     local server_hop_last_coin = os.clock()
+    local server_hop_next_attempt = 0
+    local SERVER_HOP_COOLDOWN = 25
     local SERVER_STUCK_TIMEOUT = 6 * 60
+    local server_hop_recent = getgenv().__AUTOFARM_RECENT_SERVERS
+    if type(server_hop_recent) ~= "table" then server_hop_recent = {} end
+    getgenv().__AUTOFARM_RECENT_SERVERS = server_hop_recent
+    local function remember_server(server_id)
+        if type(server_id) ~= "string" or server_id == "" then return end
+        for i = #server_hop_recent, 1, -1 do
+            if server_hop_recent[i] == server_id then table.remove(server_hop_recent, i) end
+        end
+        table.insert(server_hop_recent, 1, server_id)
+        while #server_hop_recent > 25 do table.remove(server_hop_recent) end
+    end
+    local function server_was_recent(server_id)
+        for _, seen_id in ipairs(server_hop_recent) do
+            if seen_id == server_id then return true end
+        end
+        return false
+    end
+    remember_server(tostring(game.JobId or ""))
 
     local function server_hop_request(url)
         local request_fn = rawget(getgenv(), "request")
@@ -3315,6 +3379,7 @@ do
         local best_target = nil
         local best_players = -1
 
+        -- This search runs in a spawned task, so deeper pagination will not block Heartbeat.
         for _ = 1, 10 do
             local url = string.format(
                 "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100%s",
@@ -3327,7 +3392,8 @@ do
             if not ok or type(data) ~= "table" then break end
 
             for _, server in ipairs(data.data or {}) do
-                if type(server) == "table" and server.id and server.id ~= game.JobId then
+                if type(server) == "table" and server.id and server.id ~= game.JobId
+                    and not server_was_recent(tostring(server.id)) then
                     local playing = tonumber(server.playing) or 0
                     local max_players = tonumber(server.maxPlayers) or 0
                     if max_players > 0 and playing < max_players then
@@ -3399,6 +3465,7 @@ do
             server_hop_stuck = server_hop_stuck,
             server_hop_players = server_hop_players,
             server_hop_player_limit = server_hop_player_limit,
+            recent_servers = server_hop_recent,
         }
 
         local loader = string.format([[
@@ -3445,45 +3512,46 @@ do
                 if type(data.server_hop_player_limit) == "number" then
                     server_hop_player_limit = math.clamp(data.server_hop_player_limit, 1, 10)
                 end
+                if type(data.recent_servers) == "table" then
+                    table.clear(server_hop_recent)
+                    for _, server_id in ipairs(data.recent_servers) do
+                        if type(server_id) == "string" and server_id ~= "" and #server_hop_recent < 25 then
+                            server_hop_recent[#server_hop_recent + 1] = server_id
+                        end
+                    end
+                    remember_server(tostring(game.JobId or ""))
+                end
             end
             getgenv().__QUEUE_DATA = nil
         end
     end
 
     local function perform_server_hop(reason)
-        if server_hop_busy then return false end
+        local now = os.clock()
+        if server_hop_busy or now < server_hop_next_attempt then return false end
         server_hop_busy = true
+        server_hop_next_attempt = now + SERVER_HOP_COOLDOWN
 
-        -- Queue the script before every teleport so the new server automatically
-        -- restores the AutoFarm UI and all persisted settings.
-        queue_server_hop_script()
-
-        -- When the player-count rule caused the hop, prefer a server above the configured limit.
         local require_more_players = reason == "players"
         local target = server_hop_find_target(require_more_players)
-        if target then
-            local ok = pcall(function()
-                TeleportService:TeleportToPlaceInstance(game.PlaceId, target, lp)
-            end)
-            if ok then return true end
-        elseif require_more_players then
-            -- Do not use generic Teleport here: it can put us into another
-            -- one-player server and defeats the configured player-count rule.
-            warn("[server hop] no public server found above the player limit")
+        if not target then
+            warn("[server hop] no unvisited public server found; refusing generic teleport to avoid rejoining this server")
             server_hop_busy = false
             return false
         end
 
-        -- Generic fallback is only allowed for manual/kicked/stuck hops.
+        remember_server(tostring(target))
+        -- Queue only after a valid target is chosen, so the next execution inherits
+        -- the visited-server list and cannot immediately send us back here.
+        queue_server_hop_script()
         local ok = pcall(function()
-            TeleportService:Teleport(game.PlaceId, lp)
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, target, lp)
         end)
         if ok then return true end
 
         server_hop_busy = false
         return false
     end
-
     local function reset_server_hop_coin_timer()
         server_hop_last_coin = os.clock()
     end
@@ -3514,6 +3582,7 @@ do
 
     local teleport_failed_conn = TeleportService.TeleportInitFailed:Connect(function()
         server_hop_busy = false
+        server_hop_next_attempt = math.max(server_hop_next_attempt, os.clock() + 8)
     end)
 
     local SettingsSection = SettingsTab:Section({
@@ -3568,7 +3637,13 @@ do
         },
         Callback = function(v)
             server_hop_player_limit = math.clamp(tonumber(v) or 3, 1, 10)
-            farm_config_set("server_hop_player_limit", server_hop_player_limit)
+            farm_config.server_hop_player_limit = server_hop_player_limit
+            -- Avoid writing the config file for every slider drag event.
+            local save_token = (getgenv().__AUTOFARM_LIMIT_SAVE_TOKEN or 0) + 1
+            getgenv().__AUTOFARM_LIMIT_SAVE_TOKEN = save_token
+            task.delay(0.5, function()
+                if getgenv().__AUTOFARM_LIMIT_SAVE_TOKEN == save_token then farm_config_save() end
+            end)
         end,
     })
 
@@ -3576,21 +3651,27 @@ do
         Title = "Server Hop",
         Desc = "Manually joins another public server for testing or emergency use.",
         Callback = function()
-            perform_server_hop("manual")
+            task.spawn(perform_server_hop, "manual")
         end,
     })
 
+    local server_hop_monitor_pending = false
     local settings_monitor_conn = RunService.Heartbeat:Connect(function()
-        if server_hop_busy then return end
+        if server_hop_busy or server_hop_monitor_pending or os.clock() < server_hop_next_attempt then return end
 
+        local reason = nil
         if server_hop_players and #Players:GetPlayers() <= server_hop_player_limit then
-            perform_server_hop("players")
-            return
+            reason = "players"
+        elseif server_hop_stuck and os.clock() - server_hop_last_coin >= SERVER_STUCK_TIMEOUT then
+            reason = "stuck"
         end
-
-        if server_hop_stuck and os.clock() - server_hop_last_coin >= SERVER_STUCK_TIMEOUT then
-            perform_server_hop("stuck")
-            return
+        if reason then
+            server_hop_monitor_pending = true
+            task.spawn(function()
+                local ok, err = pcall(perform_server_hop, reason)
+                if not ok then warn("[server hop] attempt failed: " .. tostring(err)) end
+                server_hop_monitor_pending = false
+            end)
         end
     end)
 
