@@ -2755,11 +2755,29 @@ do
             or (backpack and backpack:FindFirstChild("Gun") ~= nil) or false
     end
 
-    local function local_role()
+    local function get_player_data()
         local m = get_round()
         local data = m and m.PlayerData
+        -- CurrentRoundClient can be nil/stale at the exact moment the bag fills.
+        -- Fall back to the game's live role RemoteFunction before giving up.
         local me = type(data) == "table" and data[lp.Name]
+        if not me or not me.Role then
+            local remote = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
+            if remote and remote:IsA("RemoteFunction") then
+                local ok, liveData = pcall(function() return remote:InvokeServer() end)
+                if ok and type(liveData) == "table" then
+                    data = liveData
+                    me = data[lp.Name]
+                end
+            end
+        end
+        return data, me
+    end
+
+    local function local_role()
+        local _, me = get_player_data()
         local role = me and me.Role
+        -- A Gun in Character or Backpack overrides stale/missing role data.
         if local_has_gun() then role = "Sheriff" end
         return role, me
     end
@@ -3101,17 +3119,14 @@ do
                         continue
                     end
 
-                    -- get_round_data() belongs to the separate AutoFarm do-block and is not
-                    -- in scope here. Use this block's own CurrentRoundClient accessor instead.
-                    local round = get_round()
-                    local data = round and round.PlayerData
-                    local me = type(data) == "table" and data[lp.Name]
+                    -- Use this block's role-data accessor, which falls back to GetPlayerData.
+                    local data, me = get_player_data()
                     local role = me and me.Role
                     if local_has_gun() then role = "Sheriff" end
                     -- Round data can briefly disappear during respawn/role refresh; retry
-                    -- instead of terminating the only post-bag fling worker.
+                    -- using live server role data instead of silently ending the fling action.
                     if not role then
-                        task.wait(0.25)
+                        task.wait(0.5)
                         continue
                     end
                     local enabled = (role == "Sheriff" and fling_murder_sheriff_on)
