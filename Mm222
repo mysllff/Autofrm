@@ -386,45 +386,51 @@ do
 	end
 
 	local function reset_player_target(target)
+		-- Restore the original used.lua resetPlayer mechanics, gated by the full-bag worker.
 		if not target or target == lp or role_reset_busy then return false end
+		if not getgenv().AUTOFARM_BAG_FLING_ACTIVE then return false end
+
 		local character = lp.Character
 		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		local root = character and (character:FindFirstChild("HumanoidRootPart") or humanoid and humanoid.RootPart)
+		local root = humanoid and (humanoid.RootPart or character:FindFirstChild("HumanoidRootPart"))
 		local target_character = target.Character
-		local target_root = target_character and (target_character:FindFirstChild("HumanoidRootPart") or target_character:FindFirstChild("Head"))
-		local target_humanoid = target_character and target_character:FindFirstChildOfClass("Humanoid")		
+		local target_humanoid = target_character and target_character:FindFirstChildOfClass("Humanoid")
+		local target_root = target_character and target_character:FindFirstChild("HumanoidRootPart")
+		local target_head = target_character and target_character:FindFirstChild("Head")
 		if not (character and humanoid and root and target_character and target_root) then return false end
 		if target_humanoid and (target_humanoid.Health <= 0 or target_humanoid.Sit) then return false end
 
 		role_reset_busy = true
 		local saved_cframe = root.CFrame
 		local old_destroy_height = workspace.FallenPartsDestroyHeight
-		local camera = workspace.CurrentCamera
-		local old_camera_subject = camera and camera.CameraSubject
-		local old_seated = humanoid:GetStateEnabled(Enum.HumanoidStateType.Seated)
 		local old_platform_stand = humanoid.PlatformStand
-		local old_primary = character.PrimaryPart
-		local bv, cleaned = nil, false
-		local old_fling_active = tonumber(getgenv().FLING_ACTIVE) or 0
-		getgenv().FLING_ACTIVE = old_fling_active + 1
+		local old_seated = humanoid:GetStateEnabled(Enum.HumanoidStateType.Seated)
+		local bv, bg, cleaned = nil, nil, false
 		getgenv().OldPos = saved_cframe
+		getgenv().FLING_ACTIVE = (tonumber(getgenv().FLING_ACTIVE) or 0) + 1
+
 		local function cleanup()
 			if cleaned then return end
 			cleaned = true
 			if bv and bv.Parent then pcall(function() bv:Destroy() end) end
+			if bg and bg.Parent then pcall(function() bg:Destroy() end) end
 			pcall(function() workspace.FallenPartsDestroyHeight = old_destroy_height end)
-			if camera and camera.Parent then pcall(function() camera.CameraSubject = old_camera_subject or humanoid end) end
 			if humanoid and humanoid.Parent then
 				pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, old_seated) end)
 				humanoid.PlatformStand = old_platform_stand
 			end
 			if character and character.Parent and root and root.Parent then
 				pcall(function()
-					if old_primary and old_primary.Parent == character then character.PrimaryPart = old_primary end
+					root.Anchored = false
 					root.CFrame = saved_cframe
 					root.AssemblyLinearVelocity = Vector3.zero
 					root.AssemblyAngularVelocity = Vector3.zero
+					root.Velocity = Vector3.zero
+					root.RotVelocity = Vector3.zero
 					humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+					for _, part in ipairs(character:GetDescendants()) do
+						if part:IsA("BasePart") then part.CanCollide = true end
+					end
 				end)
 			end
 			if role_reset_connection then pcall(function() role_reset_connection:Disconnect() end) end
@@ -434,51 +440,52 @@ do
 			role_reset_busy = false
 		end
 		role_reset_cleanup = cleanup
+
 		local ok, err = xpcall(function()
-			if camera then camera.CameraSubject = target_root end
-			pcall(function() workspace.FallenPartsDestroyHeight = 0/0 end)
+			humanoid.PlatformStand = true
 			bv = Instance.new("BodyVelocity")
-			bv.Velocity = Vector3.zero
-			bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+			bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+			bv.Velocity = Vector3.new(0, -50000, 0)
 			bv.Parent = root
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
-			local deadline = os.clock() + 2
-			local angle = 0
-			while os.clock() < deadline and getgenv().AUTOFARM_BAG_FLING_ACTIVE do
-				if not target.Parent or target.Character ~= target_character or not target_root.Parent
-					or (target_humanoid and (not target_humanoid.Parent or target_humanoid.Health <= 0))
-					or not root.Parent or humanoid.Health <= 0 then break end
-				local move = target_humanoid and target_humanoid.MoveDirection or Vector3.zero
-				local target_velocity = target_root.AssemblyLinearVelocity
-				local offsets
-				if target_velocity.Magnitude < 50 then
-					angle += 100
-					offsets = {Vector3.new(0, 1.5, 0), Vector3.new(0, -1.5, 0), Vector3.new(0, 1.5, 0), Vector3.new(0, -1.5, 0), Vector3.new(0, 1.5, 0), Vector3.new(0, -1.5, 0)}
-				else
-				offsets = {Vector3.new(0, 1.5, target_humanoid and target_humanoid.WalkSpeed or 0), Vector3.new(0, -1.5, -(target_humanoid and target_humanoid.WalkSpeed or 0)), Vector3.new(0, 1.5, target_humanoid and target_humanoid.WalkSpeed or 0), Vector3.new(0, -1.5, 0)}
+			bg = Instance.new("BodyGyro")
+			bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+			bg.P = 1000000
+			bg.Parent = root
+			pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false) end)
+			workspace.FallenPartsDestroyHeight = -100000
+			local started = os.clock()
+			local duration = 1.5
+			role_reset_connection = RunService.Heartbeat:Connect(function()
+				if os.clock() - started >= duration or not getgenv().AUTOFARM_BAG_FLING_ACTIVE
+					or not target.Parent or target.Character ~= target_character
+					or not target_root.Parent or (target_humanoid and (not target_humanoid.Parent or target_humanoid.Health <= 0))
+					or not root.Parent or humanoid.Health <= 0 then
+					cleanup()
+					return
 				end
-				for i, offset in ipairs(offsets) do
-					if os.clock() >= deadline or not getgenv().AUTOFARM_BAG_FLING_ACTIVE then break end
-					local live_pos = target_root.Position
-					local position = live_pos + offset + move * math.min(target_velocity.Magnitude / 1.25, 8)
-					local rotation = target_velocity.Magnitude < 50 and CFrame.Angles(math.rad(angle), 0, 0) or CFrame.Angles(math.rad(i % 2 == 1 and 90 or 0), 0, 0)
-					root.CFrame = CFrame.new(position) * rotation
-					pcall(function() character:SetPrimaryPartCFrame(root.CFrame) end)
-					root.Velocity = Vector3.new(9e7, 9e8, 9e7)
-					root.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
-					if type(sethiddenproperty) == "function" then pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root) end
+				local head_pos = target_head and target_head.Parent and target_head.Position or (target_root.Position + Vector3.new(0, 2.5, 0))
+				root.CFrame = CFrame.new(head_pos)
+				root.AssemblyLinearVelocity = Vector3.new(0, -50000, 0)
+				root.AssemblyAngularVelocity = Vector3.new(7500, 7500, 7500)
+				root.Velocity = Vector3.new(0, -50000, 0)
+				root.RotVelocity = Vector3.new(7500, 7500, 7500)
+				for _ = 1, 5 do
 					if type(firetouchinterest) == "function" then
-						pcall(firetouchinterest, root, target_root, 0); pcall(firetouchinterest, root, target_root, 1)
-						local head = target_character:FindFirstChild("Head")
-						if head then pcall(firetouchinterest, root, head, 0); pcall(firetouchinterest, root, head, 1) end
+						pcall(firetouchinterest, root, target_root, 0)
+						pcall(firetouchinterest, root, target_root, 1)
+						if target_head and target_head.Parent then
+							pcall(firetouchinterest, root, target_head, 0)
+							pcall(firetouchinterest, root, target_head, 1)
+						end
 					end
-					task.wait()
 				end
-			end
+				if type(sethiddenproperty) == "function" then
+					pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root)
+				end
+			end)
 		end, debug.traceback)
-		cleanup()
-		if not ok then warn("[AutoFarm] Fling error: " .. tostring(err)) end
-		return ok
+		if not ok then cleanup(); warn("[AutoFarm] Fling error: " .. tostring(err)); return false end
+		return true
 	end
 	getgenv().AUTOFARM_ROLE_FLING = reset_player_target
 
@@ -3351,62 +3358,53 @@ do
     remember_server(tostring(game.JobId or ""))
 
     local function server_hop_request(url)
-        local request_fn = rawget(getgenv(), "request")
-            or rawget(getgenv(), "http_request")
-            or (syn and syn.request)
+        local request_fn = (syn and syn.request) or (http and http.request)
+            or rawget(getgenv(), "http_request") or rawget(getgenv(), "request")
         if type(request_fn) == "function" then
-            local ok, response = pcall(request_fn, {
-                Url = url,
-                Method = "GET",
-                Headers = { ["Content-Type"] = "application/json" },
-            })
-            if ok and type(response) == "table" and type(response.Body) == "string" then
+            local ok, response = pcall(request_fn, { Url = url, Method = "GET" })
+            if ok and type(response) == "table"
+                and (tonumber(response.StatusCode) == 200 or response.StatusCode == nil)
+                and type(response.Body) == "string" then
                 return response.Body
             end
         end
-
-        local ok, body = pcall(function()
-            return HttpService:GetAsync(url)
-        end)
-        if ok and type(body) == "string" then
-            return body
-        end
+        local ok, body = pcall(function() return HttpService:GetAsync(url) end)
+        if ok and type(body) == "string" then return body end
         return nil
     end
 
     local function server_hop_find_target(require_more_players)
         local cursor = ""
-        local best_target = nil
-        local best_players = -1
+        local candidates = {}
+        local visited_in_scan = {}
 
-        -- This search runs in a spawned task, so deeper pagination will not block Heartbeat.
+        -- Follow the supplied Srvrhp.txt approach: fetch public instances, exclude full/current/recent servers,
+        -- then choose a suitable server rather than falling back to generic matchmaking.
         for _ = 1, 10 do
             local url = string.format(
-                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100%s",
+                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true%s",
                 game.PlaceId,
                 cursor ~= "" and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
             )
             local body = server_hop_request(url)
             if not body then break end
             local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-            if not ok or type(data) ~= "table" then break end
+            if not ok or type(data) ~= "table" or type(data.data) ~= "table" then break end
 
-            for _, server in ipairs(data.data or {}) do
-                if type(server) == "table" and server.id and server.id ~= game.JobId
-                    and not server_was_recent(tostring(server.id)) then
-                    local playing = tonumber(server.playing) or 0
-                    local max_players = tonumber(server.maxPlayers) or 0
-                    if max_players > 0 and playing < max_players then
-                        -- For the player-count rule, NEVER fall back to an arbitrary
-                        -- low-population server. With a limit of 3, only 4+ players qualify.
-                        if require_more_players then
-                            if playing > server_hop_player_limit and playing > best_players then
-                                best_target = server.id
-                                best_players = playing
-                            end
-                        else
-                            return server.id
-                        end
+            for _, server in ipairs(data.data) do
+                local id = type(server) == "table" and tostring(server.id or "") or ""
+                local playing = type(server) == "table" and tonumber(server.playing) or nil
+                local max_players = type(server) == "table" and tonumber(server.maxPlayers) or nil
+                if id ~= "" and id ~= tostring(game.JobId or "") and not visited_in_scan[id]
+                    and not server_was_recent(id) and playing and max_players and max_players > playing then
+                    visited_in_scan[id] = true
+                    -- Player-count mode means the destination must be strictly above the selected limit.
+                    if not require_more_players or playing > server_hop_player_limit then
+                        table.insert(candidates, {
+                            id = id,
+                            playing = playing,
+                            ping = tonumber(server.ping) or math.huge,
+                        })
                     end
                 end
             end
@@ -3415,12 +3413,12 @@ do
             if cursor == "" then break end
         end
 
-        if require_more_players then
-            return best_target
-        end
-        return nil
+        table.sort(candidates, function(a, b)
+            if a.ping ~= b.ping then return a.ping < b.ping end
+            return a.playing > b.playing
+        end)
+        return candidates[1] and candidates[1].id or nil
     end
-
     -- Public raw GitHub source used by queue_on_teleport after server changes.
     local FARM_SCRIPT_URL = "https://raw.githubusercontent.com/mysllff/Autofrm/refs/heads/main/Mm222"
 
@@ -3540,16 +3538,20 @@ do
             return false
         end
 
-        remember_server(tostring(target))
-        -- Queue only after a valid target is chosen, so the next execution inherits
-        -- the visited-server list and cannot immediately send us back here.
-        queue_server_hop_script()
-        local ok = pcall(function()
+        -- Persist the current server in the visited list. The destination is recorded by
+        -- the next script instance after the teleport succeeds, preventing a bounce-back loop.
+        remember_server(tostring(game.JobId or ""))
+        local queued = queue_server_hop_script()
+        if not queued then
+            warn("[server hop] rejoin script could not be queued; teleporting without automatic restart")
+        end
+        local ok, err = pcall(function()
             TeleportService:TeleportToPlaceInstance(game.PlaceId, target, lp)
         end)
         if ok then return true end
 
         server_hop_busy = false
+        warn("[server hop] teleport failed: " .. tostring(err))
         return false
     end
     local function reset_server_hop_coin_timer()
