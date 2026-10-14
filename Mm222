@@ -3104,6 +3104,7 @@ do
     local role_fling_role = nil
     local role_fling_thread
     local role_fling_last_error_at = 0
+    local role_fling_target = nil
 
     local function role_fling_step()
         if role_fling_thread then return end
@@ -3134,6 +3135,19 @@ do
                     if not enabled then break end
 
                     local target, target_info
+                    -- Keep the last acquired target so stale role data cannot make the worker
+                    -- loop forever after the Murderer has died or left the server.
+                    if role_fling_target and (not role_fling_target.Parent) then
+                        break
+                    end
+                    if role_fling_target then
+                        local previousChar = role_fling_target.Character
+                        local previousHum = previousChar and previousChar:FindFirstChildOfClass("Humanoid")
+                        if previousHum and previousHum.Health <= 0 then
+                            break
+                        end
+                    end
+
                     -- Match used.lua's findMurderer(): query the game's GetPlayerData
                     -- RemoteFunction first, then fall back to CurrentRoundClient.PlayerData.
                     local getPlayerData = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
@@ -3176,6 +3190,7 @@ do
                         break
                     end
 
+                    role_fling_target = target
                     local targetChar = target.Character
                     local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
                     local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
@@ -3214,6 +3229,8 @@ do
                 task.delay(0.5, role_fling_step)
             else
                 getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
+                role_fling_target = nil
+                role_fling_role = nil
             end
         end)
     end
@@ -3223,6 +3240,7 @@ do
         if not bag_is_full() then
             getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
             role_fling_role = nil
+            role_fling_target = nil
             return
         end
         getgenv().AUTOFARM_BAG_FLING_ACTIVE = true
