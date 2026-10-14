@@ -3104,7 +3104,6 @@ do
     local role_fling_role = nil
     local role_fling_thread
     local role_fling_last_error_at = 0
-    local role_fling_target = nil
 
     local function role_fling_step()
         if role_fling_thread then return end
@@ -3122,7 +3121,9 @@ do
 
                     -- Use this block's role-data accessor, which falls back to GetPlayerData.
                     local data, me = get_player_data()
-                    local role = me and me.Role
+                    -- Keep the known-good old worker's role override: the bag action may
+                    -- start before CurrentRoundClient has replicated the local role.
+                    local role = role_fling_role or (me and me.Role)
                     if local_has_gun() then role = "Sheriff" end
                     -- Round data can briefly disappear during respawn/role refresh; retry
                     -- using live server role data instead of silently ending the fling action.
@@ -3135,19 +3136,6 @@ do
                     if not enabled then break end
 
                     local target, target_info
-                    -- Keep the last acquired target so stale role data cannot make the worker
-                    -- loop forever after the Murderer has died or left the server.
-                    if role_fling_target and (not role_fling_target.Parent) then
-                        break
-                    end
-                    if role_fling_target then
-                        local previousChar = role_fling_target.Character
-                        local previousHum = previousChar and previousChar:FindFirstChildOfClass("Humanoid")
-                        if previousHum and previousHum.Health <= 0 then
-                            break
-                        end
-                    end
-
                     -- Match used.lua's findMurderer(): query the game's GetPlayerData
                     -- RemoteFunction first, then fall back to CurrentRoundClient.PlayerData.
                     local getPlayerData = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
@@ -3158,7 +3146,7 @@ do
                         if okData and type(serverData) == "table" then
                             for name, info in pairs(serverData) do
                                 if type(info) == "table" and info.Role == "Murderer"
-                                    and not info.Dead and not info.Killed and name ~= lp.Name then
+                                    and name ~= lp.Name then
                                     target_info = info
                                     target = Players:FindFirstChild(name)
                                     if target then break end
@@ -3169,7 +3157,7 @@ do
                     if not target and type(data) == "table" then
                         for name, info in pairs(data) do
                             if type(info) == "table" and info.Role == "Murderer"
-                                and not info.Dead and not info.Killed and name ~= lp.Name then
+                                and name ~= lp.Name then
                                 target_info = info
                                 target = Players:FindFirstChild(name)
                                 if target then break end
@@ -3190,7 +3178,6 @@ do
                         break
                     end
 
-                    role_fling_target = target
                     local targetChar = target.Character
                     local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
                     local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
@@ -3229,8 +3216,6 @@ do
                 task.delay(0.5, role_fling_step)
             else
                 getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
-                role_fling_target = nil
-                role_fling_role = nil
             end
         end)
     end
@@ -3240,19 +3225,20 @@ do
         if not bag_is_full() then
             getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
             role_fling_role = nil
-            role_fling_target = nil
             return
         end
         getgenv().AUTOFARM_BAG_FLING_ACTIVE = true
         local bag_role = local_role()
-        if bag_role == "Sheriff" and fling_murder_sheriff_on then
-            role_fling_role = "Sheriff"
-            role_fling_step()
-        elseif bag_role == "Innocent" and fling_murder_innocent_on then
-            role_fling_role = "Innocent"
-            role_fling_step()
+        if local_has_gun() then bag_role = "Sheriff" end
+        if bag_role == "Sheriff" or bag_role == "Innocent" then
+            role_fling_role = bag_role
         else
+            -- Do not miss the one-shot full-bag callback if role data is temporarily
+            -- unavailable. The worker will keep retrying and resolve the role itself.
             role_fling_role = nil
+        end
+        if fling_murder_sheriff_on or fling_murder_innocent_on then
+            role_fling_step()
         end
         if kill_all_on then pcall(kill_all) end
         if autoshoot_on then
@@ -3279,7 +3265,12 @@ do
         Callback = function(v)
             fling_murder_sheriff_on = v
             farm_config_set("fling_murderer_sheriff", v)
-            if not v and role_fling_role == "Sheriff" then
+            if v and getgenv().AUTOFARM_BAG_FLING_ACTIVE and bag_is_full() then
+                local current_role = local_role()
+                if local_has_gun() then current_role = "Sheriff" end
+                role_fling_role = (current_role == "Sheriff" or current_role == "Innocent") and current_role or nil
+                role_fling_step()
+            elseif not v and role_fling_role == "Sheriff" then
                 role_fling_role = nil
             end
         end,
@@ -3293,7 +3284,14 @@ do
         Callback = function(v)
             fling_murder_innocent_on = v
             farm_config_set("fling_murderer_innocent", v)
-            if not v and role_fling_role == "Innocent" then
+            if v and getgenv().AUTOFARM_BAG_FLING_ACTIVE and bag_is_full() then
+                -- Mirror the old working toggle behavior: enabling fling after the bag
+                -- is full must start the worker immediately, not wait for another bag.
+                local current_role = local_role()
+                if local_has_gun() then current_role = "Sheriff" end
+                role_fling_role = (current_role == "Sheriff" or current_role == "Innocent") and current_role or nil
+                role_fling_step()
+            elseif not v and role_fling_role == "Innocent" then
                 role_fling_role = nil
             end
         end,
