@@ -300,26 +300,22 @@ do
 	local farm_stage_locked_was_anchored = nil
 	local farm_unknown_stage_position = Vector3.new(14.35, 504.82, -3.25)
 
+	-- Anti-targeting staging must not anchor HumanoidRootPart locally:
+	-- anchoring can make the move appear correct only on this client while the
+	-- server/other players retain the previous replicated position.
 	local function farm_stage_unlock()
-		local root = farm_stage_locked_root
-		if root and root.Parent and farm_stage_locked_was_anchored ~= nil then
-			pcall(function() root.Anchored = farm_stage_locked_was_anchored end)
-		end
 		farm_stage_locked_root = nil
 		farm_stage_locked_was_anchored = nil
 	end
 
 	local function farm_stage_lock(root)
 		if not root or not root.Parent then return end
-		if farm_stage_locked_root ~= root then
-			farm_stage_unlock()
-			farm_stage_locked_root = root
-			farm_stage_locked_was_anchored = root.Anchored
-		end
+		farm_stage_locked_root = root
+		-- Keep the root unanchored so normal character network ownership can replicate it.
 		pcall(function()
+			root.Anchored = false
 			root.AssemblyLinearVelocity = Vector3.zero
 			root.AssemblyAngularVelocity = Vector3.zero
-			root.Anchored = true
 		end)
 	end
 	local down_ref_y = nil
@@ -428,9 +424,8 @@ do
 					root.Velocity = Vector3.zero
 					root.RotVelocity = Vector3.zero
 					humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-					for _, part in ipairs(character:GetDescendants()) do
-						if part:IsA("BasePart") then part.CanCollide = true end
-					end
+					-- This reset routine does not change CanCollide. Do not force every
+					-- part back to true here, because that overrides AutoFarm's noclip cache.
 				end)
 			end
 			if role_reset_connection then pcall(function() role_reset_connection:Disconnect() end) end
@@ -455,7 +450,7 @@ do
 			workspace.FallenPartsDestroyHeight = -100000
 			local started = os.clock()
 			local duration = 1.5
-			role_reset_connection = RunService.Heartbeat:Connect(function()
+			role_reset_connection = game:GetService("RunService").Heartbeat:Connect(function()
 				if os.clock() - started >= duration or not getgenv().AUTOFARM_BAG_FLING_ACTIVE
 					or not target.Parent or target.Character ~= target_character
 					or not target_root.Parent or (target_humanoid and (not target_humanoid.Parent or target_humanoid.Health <= 0))
@@ -467,8 +462,6 @@ do
 				root.CFrame = CFrame.new(head_pos)
 				root.AssemblyLinearVelocity = Vector3.new(0, -50000, 0)
 				root.AssemblyAngularVelocity = Vector3.new(7500, 7500, 7500)
-				root.Velocity = Vector3.new(0, -50000, 0)
-				root.RotVelocity = Vector3.new(7500, 7500, 7500)
 				for _ = 1, 5 do
 					if type(firetouchinterest) == "function" then
 						pcall(firetouchinterest, root, target_root, 0)
@@ -478,9 +471,6 @@ do
 							pcall(firetouchinterest, root, target_head, 1)
 						end
 					end
-				end
-				if type(sethiddenproperty) == "function" then
-					pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root)
 				end
 			end)
 		end, debug.traceback)
@@ -641,22 +631,20 @@ do
 		local now = os.clock()
 		local same_position = farm_stage_last_teleport_position
 			and (farm_stage_last_teleport_position - position).Magnitude < 1
-		if same_position and farm_stage_locked_root == hrp and (hrp.Position - position).Magnitude <= 8 then
-			farm_stage_lock(hrp)
-			return true
-		end
-		-- Anchor only while waiting for the round/map to initialize. Noclip + PlatformStand
-		-- let gravity pull the character down, causing the old fall/teleport loop.
-		if same_position and now - farm_stage_last_teleport < 0.9 then
-			farm_stage_lock(hrp)
-			return false
-		end
+		-- Keep collision disabled while staging so the character cannot jitter
+		-- against map geometry. The root stays unanchored for normal replication.
+		set_farm_noclip(true)
 		farm_stage_lock(hrp)
 		local ok = pcall(function()
-			hrp.CFrame = CFrame.new(position)
+			local character = lp.Character
+			if character and character.Parent then
+				character:PivotTo(CFrame.new(position))
+			else
+				hrp.CFrame = CFrame.new(position)
+			end
+			hrp.Anchored = false
 			hrp.AssemblyLinearVelocity = Vector3.zero
 			hrp.AssemblyAngularVelocity = Vector3.zero
-			hrp.Anchored = true
 		end)
 		if ok then
 			farm_stage_last_teleport = now
@@ -912,7 +900,6 @@ do
 			if stage_pos then
 				farm_stage_ready = true
 				farm_stage_unlock()
-				set_farm_noclip(false)
 					hrp = farm_hrp()
 				if not hrp then return end
 			else
@@ -920,7 +907,6 @@ do
 				if inferred_position then farm_stage_to_map(inferred_position) end
 				farm_stage_ready = true
 				farm_stage_unlock()
-				set_farm_noclip(false)
 					hrp = farm_hrp()
 				if not hrp then return end
 			end
@@ -3113,17 +3099,14 @@ do
                 -- This loop survives local death/respawn and ends only when the target Murderer dies,
                 -- the corresponding toggle is disabled, or the bag action is explicitly cancelled.
                 while getgenv().AUTOFARM_BAG_FLING_ACTIVE do
-                    -- Never run the fling unless the visible bag UI confirms it is full.
-                    if not bag_is_full() then
-                        task.wait(0.25)
-                        continue
-                    end
+                    -- The full bag is checked before this worker starts in post_bag_actions().
+                    -- Do not re-check the bag UI here: it can reset when the local player dies.
+                    -- Keep retrying after respawn until the Murderer is confirmed dead, the
+                    -- feature is disabled, or the round explicitly cancels post-bag actions.
 
                     -- Use this block's role-data accessor, which falls back to GetPlayerData.
                     local data, me = get_player_data()
-                    -- Keep the known-good old worker's role override: the bag action may
-                    -- start before CurrentRoundClient has replicated the local role.
-                    local role = role_fling_role or (me and me.Role)
+                    local role = me and me.Role
                     if local_has_gun() then role = "Sheriff" end
                     -- Round data can briefly disappear during respawn/role refresh; retry
                     -- using live server role data instead of silently ending the fling action.
@@ -3136,6 +3119,7 @@ do
                     if not enabled then break end
 
                     local target, target_info
+                    local murderer_confirmed_dead = false
                     -- Match used.lua's findMurderer(): query the game's GetPlayerData
                     -- RemoteFunction first, then fall back to CurrentRoundClient.PlayerData.
                     local getPlayerData = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
@@ -3145,8 +3129,11 @@ do
                         end)
                         if okData and type(serverData) == "table" then
                             for name, info in pairs(serverData) do
-                                if type(info) == "table" and info.Role == "Murderer"
-                                    and name ~= lp.Name then
+                                if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
+                                    if info.Dead == true or info.Killed == true then
+                                        murderer_confirmed_dead = true
+                                        break
+                                    end
                                     target_info = info
                                     target = Players:FindFirstChild(name)
                                     if target then break end
@@ -3154,16 +3141,21 @@ do
                             end
                         end
                     end
+                    if murderer_confirmed_dead then break end
                     if not target and type(data) == "table" then
                         for name, info in pairs(data) do
-                            if type(info) == "table" and info.Role == "Murderer"
-                                and name ~= lp.Name then
+                            if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
+                                if info.Dead == true or info.Killed == true then
+                                    murderer_confirmed_dead = true
+                                    break
+                                end
                                 target_info = info
                                 target = Players:FindFirstChild(name)
                                 if target then break end
                             end
                         end
                     end
+                    if murderer_confirmed_dead then break end
 
                     -- Do not fling during the lobby/device-selection phase. Require valid role
                     -- data for both players and a live Murderer character before engaging.
@@ -3210,9 +3202,9 @@ do
             end
 
             role_fling_thread = nil
-            if not ok and getgenv().AUTOFARM_BAG_FLING_ACTIVE and bag_is_full() then
-                -- Retry only after an unexpected error; normal exits (dead target or disabled
-                -- role toggle) must stop instead of creating a restart loop.
+            if not ok and getgenv().AUTOFARM_BAG_FLING_ACTIVE then
+                -- Retry after unexpected errors even if the bag UI reset during local death.
+                -- Explicit cancellation and normal exits still stop the worker.
                 task.delay(0.5, role_fling_step)
             else
                 getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
@@ -3221,24 +3213,25 @@ do
     end
 
     local function post_bag_actions()
-        -- Hard safety gate: no fling/kill/shoot actions unless the visible coin bag is full.
+        -- This callback is the only entry point for post-bag actions.
+        -- Do not enable the fling worker until the visible coin bag is confirmed full.
         if not bag_is_full() then
             getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
             role_fling_role = nil
             return
         end
-        getgenv().AUTOFARM_BAG_FLING_ACTIVE = true
         local bag_role = local_role()
-        if local_has_gun() then bag_role = "Sheriff" end
-        if bag_role == "Sheriff" or bag_role == "Innocent" then
-            role_fling_role = bag_role
-        else
-            -- Do not miss the one-shot full-bag callback if role data is temporarily
-            -- unavailable. The worker will keep retrying and resolve the role itself.
-            role_fling_role = nil
-        end
-        if fling_murder_sheriff_on or fling_murder_innocent_on then
+        local should_fling = (bag_role == "Sheriff" and fling_murder_sheriff_on)
+            or (bag_role == "Innocent" and fling_murder_innocent_on)
+        getgenv().AUTOFARM_BAG_FLING_ACTIVE = should_fling == true
+        if bag_role == "Sheriff" and fling_murder_sheriff_on then
+            role_fling_role = "Sheriff"
             role_fling_step()
+        elseif bag_role == "Innocent" and fling_murder_innocent_on then
+            role_fling_role = "Innocent"
+            role_fling_step()
+        else
+            role_fling_role = nil
         end
         if kill_all_on then pcall(kill_all) end
         if autoshoot_on then
@@ -3265,12 +3258,7 @@ do
         Callback = function(v)
             fling_murder_sheriff_on = v
             farm_config_set("fling_murderer_sheriff", v)
-            if v and getgenv().AUTOFARM_BAG_FLING_ACTIVE and bag_is_full() then
-                local current_role = local_role()
-                if local_has_gun() then current_role = "Sheriff" end
-                role_fling_role = (current_role == "Sheriff" or current_role == "Innocent") and current_role or nil
-                role_fling_step()
-            elseif not v and role_fling_role == "Sheriff" then
+            if not v and role_fling_role == "Sheriff" then
                 role_fling_role = nil
             end
         end,
@@ -3284,14 +3272,7 @@ do
         Callback = function(v)
             fling_murder_innocent_on = v
             farm_config_set("fling_murderer_innocent", v)
-            if v and getgenv().AUTOFARM_BAG_FLING_ACTIVE and bag_is_full() then
-                -- Mirror the old working toggle behavior: enabling fling after the bag
-                -- is full must start the worker immediately, not wait for another bag.
-                local current_role = local_role()
-                if local_has_gun() then current_role = "Sheriff" end
-                role_fling_role = (current_role == "Sheriff" or current_role == "Innocent") and current_role or nil
-                role_fling_step()
-            elseif not v and role_fling_role == "Innocent" then
+            if not v and role_fling_role == "Innocent" then
                 role_fling_role = nil
             end
         end,
