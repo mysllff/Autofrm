@@ -298,23 +298,61 @@ do
 	local farm_stage_last_teleport_position = nil
 	local farm_stage_locked_root = nil
 	local farm_stage_locked_was_anchored = nil
+	local farm_stage_hover_position = nil
+	local farm_stage_hover_mover = nil
+	local farm_stage_hover_gyro = nil
 	local farm_unknown_stage_position = Vector3.new(14.35, 504.82, -3.25)
 
-	-- Anti-targeting staging must not anchor HumanoidRootPart locally:
-	-- anchoring can make the move appear correct only on this client while the
-	-- server/other players retain the previous replicated position.
 	local function farm_stage_unlock()
+		local root = farm_stage_locked_root
+		if farm_stage_hover_mover then
+			pcall(function() farm_stage_hover_mover:Destroy() end)
+		end
+		if farm_stage_hover_gyro then
+			pcall(function() farm_stage_hover_gyro:Destroy() end)
+		end
+		if root and root.Parent and farm_stage_locked_was_anchored ~= nil then
+			pcall(function() root.Anchored = farm_stage_locked_was_anchored end)
+		end
 		farm_stage_locked_root = nil
 		farm_stage_locked_was_anchored = nil
+		farm_stage_hover_position = nil
+		farm_stage_hover_mover = nil
+		farm_stage_hover_gyro = nil
 	end
 
-	local function farm_stage_lock(root)
+	local function farm_stage_lock(root, position)
 		if not root or not root.Parent then return end
-		farm_stage_locked_root = root
-		-- Keep the root unanchored so normal character network ownership can replicate it.
+		position = position or root.Position
+		if farm_stage_locked_root ~= root then
+			farm_stage_unlock()
+			farm_stage_locked_root = root
+			farm_stage_locked_was_anchored = root.Anchored
+		end
+		farm_stage_hover_position = position
 		pcall(function()
+			-- Keep the character floating naturally instead of anchoring it into a rigid pose.
 			root.Anchored = false
-			root.AssemblyLinearVelocity = Vector3.zero
+			if not farm_stage_hover_mover or farm_stage_hover_mover.Parent ~= root then
+				if farm_stage_hover_mover then farm_stage_hover_mover:Destroy() end
+				farm_stage_hover_mover = Instance.new("BodyPosition")
+				farm_stage_hover_mover.Name = "AutoFarmStageHover"
+				farm_stage_hover_mover.MaxForce = Vector3.new(1e7, 1e7, 1e7)
+				farm_stage_hover_mover.P = 9000
+				farm_stage_hover_mover.D = 1200
+				farm_stage_hover_mover.Parent = root
+			end
+			if not farm_stage_hover_gyro or farm_stage_hover_gyro.Parent ~= root then
+				if farm_stage_hover_gyro then farm_stage_hover_gyro:Destroy() end
+				farm_stage_hover_gyro = Instance.new("BodyGyro")
+				farm_stage_hover_gyro.Name = "AutoFarmStageHoverGyro"
+				farm_stage_hover_gyro.MaxTorque = Vector3.new(1e7, 1e7, 1e7)
+				farm_stage_hover_gyro.P = 4500
+				farm_stage_hover_gyro.D = 500
+				farm_stage_hover_gyro.CFrame = root.CFrame - root.Position
+				farm_stage_hover_gyro.Parent = root
+			end
+			farm_stage_hover_mover.Position = position
 			root.AssemblyAngularVelocity = Vector3.zero
 		end)
 	end
@@ -376,9 +414,6 @@ do
 		pcall(function() root.Velocity = Vector3.zero; root.RotVelocity = Vector3.zero end)
 		if saved_cframe then root.CFrame = saved_cframe end
 		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-		for _, part in ipairs(character:GetDescendants()) do
-			if part:IsA("BasePart") then part.CanCollide = true end
-		end
 	end
 
 	local function reset_player_target(target)
@@ -410,7 +445,7 @@ do
 			cleaned = true
 			if bv and bv.Parent then pcall(function() bv:Destroy() end) end
 			if bg and bg.Parent then pcall(function() bg:Destroy() end) end
-			pcall(function() workspace.FallenPartsDestroyHeight = old_destroy_height end)
+			pcall(function() workspace.FallenPartsDestroyHeight = (anti_void and -9e9) or (type(old_destroy_height) == "number" and old_destroy_height or -500) end)
 			if humanoid and humanoid.Parent then
 				pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, old_seated) end)
 				humanoid.PlatformStand = old_platform_stand
@@ -424,8 +459,6 @@ do
 					root.Velocity = Vector3.zero
 					root.RotVelocity = Vector3.zero
 					humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-					-- This reset routine does not change CanCollide. Do not force every
-					-- part back to true here, because that overrides AutoFarm's noclip cache.
 				end)
 			end
 			if role_reset_connection then pcall(function() role_reset_connection:Disconnect() end) end
@@ -631,20 +664,21 @@ do
 		local now = os.clock()
 		local same_position = farm_stage_last_teleport_position
 			and (farm_stage_last_teleport_position - position).Magnitude < 1
-		-- Keep collision disabled while staging so the character cannot jitter
-		-- against map geometry. The root stays unanchored for normal replication.
-		set_farm_noclip(true)
-		farm_stage_lock(hrp)
+		if same_position and farm_stage_locked_root == hrp and (hrp.Position - position).Magnitude <= 8 then
+			farm_stage_lock(hrp, position)
+			return true
+		end
+		if same_position and now - farm_stage_last_teleport < 0.9 then
+			farm_stage_lock(hrp, position)
+			return false
+		end
+		farm_stage_lock(hrp, position)
 		local ok = pcall(function()
-			local character = lp.Character
-			if character and character.Parent then
-				character:PivotTo(CFrame.new(position))
-			else
-				hrp.CFrame = CFrame.new(position)
-			end
 			hrp.Anchored = false
+			hrp.CFrame = CFrame.new(position)
 			hrp.AssemblyLinearVelocity = Vector3.zero
 			hrp.AssemblyAngularVelocity = Vector3.zero
+			if farm_stage_hover_mover then farm_stage_hover_mover.Position = position end
 		end)
 		if ok then
 			farm_stage_last_teleport = now
@@ -872,6 +906,24 @@ do
 		end)
 	end
 
+	local function set_stage_collision(on)
+		local char = lp.Character
+		if on then
+			if not char then return end
+			for _, part in ipairs(char:GetDescendants()) do
+				if part:IsA("BasePart") then
+					if nc_cache[part] == nil then nc_cache[part] = part.CanCollide end
+					part.CanCollide = false
+				end
+			end
+		else
+			for part, was_collidable in pairs(nc_cache) do
+				if part and part.Parent then pcall(function() part.CanCollide = was_collidable end) end
+			end
+			nc_cache = {}
+		end
+	end
+
 	local farm_conn = run.Stepped:Connect(function(_, dt)
 		if not autofarm_on then return end
 		if not can_farm() then
@@ -890,6 +942,7 @@ do
 		local stage_coins = available_coins()
 		if not farm_stage_ready then
 			if #stage_coins == 0 then
+				set_stage_collision(true)
 				if stage_pos then
 					stage_before_coins()
 				else
@@ -900,6 +953,7 @@ do
 			if stage_pos then
 				farm_stage_ready = true
 				farm_stage_unlock()
+				set_farm_noclip(false)
 					hrp = farm_hrp()
 				if not hrp then return end
 			else
@@ -907,6 +961,7 @@ do
 				if inferred_position then farm_stage_to_map(inferred_position) end
 				farm_stage_ready = true
 				farm_stage_unlock()
+				set_farm_noclip(false)
 					hrp = farm_hrp()
 				if not hrp then return end
 			end
@@ -3026,13 +3081,7 @@ do
         local c = lp.Character
         return c and c:FindFirstChildOfClass("Humanoid")
     end
-    local function trap_kill_gui()
-        local gui = lp:FindFirstChildOfClass("PlayerGui")
-        if not gui then return end
-        for _, child in ipairs(gui:GetChildren()) do
-            if child.Name == "TrapGUI" then pcall(function() child:Destroy() end) end
-        end
-    end
+    -- Keep TrapGUI intact; Anti-Trap restores movement without breaking trap UI flow.
     local function trap_unlock(hum)
         if not hum or not hum.Parent then return end
         pcall(function()
@@ -3048,16 +3097,17 @@ do
             if hum.WalkSpeed > TRAP_LOCK then trap_speed_cache = hum.WalkSpeed end
             if hum.JumpPower > TRAP_LOCK then trap_jump_cache = hum.JumpPower end
         end
-        trap_kill_gui()
         if trap_busy then return end
         trap_busy = true
         task.spawn(function()
-            while anti_trap and os.clock() < trap_window do
-                trap_unlock(trap_hum())
-                trap_kill_gui()
-                RunService.Heartbeat:Wait()
-            end
+            local ok, err = xpcall(function()
+                while anti_trap and os.clock() < trap_window do
+                    trap_unlock(trap_hum())
+                    RunService.Heartbeat:Wait()
+                end
+            end, debug.traceback)
             trap_busy = false
+            if not ok then warn("[AutoFarm] Anti-Trap worker error: " .. tostring(err)) end
         end)
     end
     local function trap_attach()
@@ -3099,10 +3149,11 @@ do
                 -- This loop survives local death/respawn and ends only when the target Murderer dies,
                 -- the corresponding toggle is disabled, or the bag action is explicitly cancelled.
                 while getgenv().AUTOFARM_BAG_FLING_ACTIVE do
-                    -- The full bag is checked before this worker starts in post_bag_actions().
-                    -- Do not re-check the bag UI here: it can reset when the local player dies.
-                    -- Keep retrying after respawn until the Murderer is confirmed dead, the
-                    -- feature is disabled, or the round explicitly cancels post-bag actions.
+                    -- Never run the fling unless the visible bag UI confirms it is full.
+                    if not bag_is_full() then
+                        task.wait(0.25)
+                        continue
+                    end
 
                     -- Use this block's role-data accessor, which falls back to GetPlayerData.
                     local data, me = get_player_data()
@@ -3119,7 +3170,6 @@ do
                     if not enabled then break end
 
                     local target, target_info
-                    local murderer_confirmed_dead = false
                     -- Match used.lua's findMurderer(): query the game's GetPlayerData
                     -- RemoteFunction first, then fall back to CurrentRoundClient.PlayerData.
                     local getPlayerData = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
@@ -3129,11 +3179,8 @@ do
                         end)
                         if okData and type(serverData) == "table" then
                             for name, info in pairs(serverData) do
-                                if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
-                                    if info.Dead == true or info.Killed == true then
-                                        murderer_confirmed_dead = true
-                                        break
-                                    end
+                                if type(info) == "table" and info.Role == "Murderer"
+                                    and not info.Dead and not info.Killed and name ~= lp.Name then
                                     target_info = info
                                     target = Players:FindFirstChild(name)
                                     if target then break end
@@ -3141,21 +3188,16 @@ do
                             end
                         end
                     end
-                    if murderer_confirmed_dead then break end
                     if not target and type(data) == "table" then
                         for name, info in pairs(data) do
-                            if type(info) == "table" and info.Role == "Murderer" and name ~= lp.Name then
-                                if info.Dead == true or info.Killed == true then
-                                    murderer_confirmed_dead = true
-                                    break
-                                end
+                            if type(info) == "table" and info.Role == "Murderer"
+                                and not info.Dead and not info.Killed and name ~= lp.Name then
                                 target_info = info
                                 target = Players:FindFirstChild(name)
                                 if target then break end
                             end
                         end
                     end
-                    if murderer_confirmed_dead then break end
 
                     -- Do not fling during the lobby/device-selection phase. Require valid role
                     -- data for both players and a live Murderer character before engaging.
@@ -3202,9 +3244,9 @@ do
             end
 
             role_fling_thread = nil
-            if not ok and getgenv().AUTOFARM_BAG_FLING_ACTIVE then
-                -- Retry after unexpected errors even if the bag UI reset during local death.
-                -- Explicit cancellation and normal exits still stop the worker.
+            if not ok and getgenv().AUTOFARM_BAG_FLING_ACTIVE and bag_is_full() then
+                -- Retry only after an unexpected error; normal exits (dead target or disabled
+                -- role toggle) must stop instead of creating a restart loop.
                 task.delay(0.5, role_fling_step)
             else
                 getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
@@ -3213,17 +3255,14 @@ do
     end
 
     local function post_bag_actions()
-        -- This callback is the only entry point for post-bag actions.
-        -- Do not enable the fling worker until the visible coin bag is confirmed full.
+        -- Hard safety gate: no fling/kill/shoot actions unless the visible coin bag is full.
         if not bag_is_full() then
             getgenv().AUTOFARM_BAG_FLING_ACTIVE = false
             role_fling_role = nil
             return
         end
+        getgenv().AUTOFARM_BAG_FLING_ACTIVE = true
         local bag_role = local_role()
-        local should_fling = (bag_role == "Sheriff" and fling_murder_sheriff_on)
-            or (bag_role == "Innocent" and fling_murder_innocent_on)
-        getgenv().AUTOFARM_BAG_FLING_ACTIVE = should_fling == true
         if bag_role == "Sheriff" and fling_murder_sheriff_on then
             role_fling_role = "Sheriff"
             role_fling_step()
